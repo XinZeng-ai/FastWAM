@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NPROC_PER_NODE="${1:?Usage: bash scripts/train.sh <nproc_per_node> [hydra_overrides...]}"
+NPROC_PER_NODE="${1:?Usage: bash scripts/train_zero2.sh <nproc_per_node> [hydra_overrides...]}"
 shift
 
 EXTRA_ARGS=("$@")
