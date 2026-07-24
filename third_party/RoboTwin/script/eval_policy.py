@@ -70,8 +70,11 @@ def get_eval_video_size(args):
         wrist_camera_cfg = get_camera_config(args["camera"]["wrist_camera_type"])
         wrist_w = int(wrist_camera_cfg["w"])
         wrist_h = int(wrist_camera_cfg["h"])
-        video_w = max(video_w, wrist_w * 2)
-        video_h = video_h + wrist_h
+        video_w = wrist_w * 2
+        resized_head_h = round(
+            int(head_camera_cfg["h"]) * video_w / int(head_camera_cfg["w"])
+        )
+        video_h = resized_head_h + wrist_h
 
     return f"{video_w}x{video_h}"
 
@@ -381,9 +384,11 @@ def eval_policy(task_name,
             if current_video_path is None or not current_video_path.exists():
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
             is_randomized = "randomized" in str(args["task_config"]).lower()
+            eval_phase = "randomized" if is_randomized else "clean"
+            eval_result = "success" if succ else "fail"
             renamed_video_path = (
                 Path(TASK_ENV.eval_video_path)
-                / f"episode{episode_idx}_randomized-{str(is_randomized).lower()}_success-{str(succ).lower()}.mp4"
+                / f"episode{episode_idx}_{eval_phase}_{eval_result}.mp4"
             )
             current_video_path.rename(renamed_video_path)
 

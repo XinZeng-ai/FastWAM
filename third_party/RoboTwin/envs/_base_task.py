@@ -23,6 +23,7 @@ from pathlib import Path
 import trimesh
 import imageio
 import glob
+import cv2
 
 
 from ._GLOBAL_CONFIGS import *
@@ -48,18 +49,13 @@ class Base_Task(gym.Env):
         left_rgb = obs["left_camera"]["rgb"]
         right_rgb = obs["right_camera"]["rgb"]
         bottom_rgb = np.concatenate([left_rgb, right_rgb], axis=1)
-        target_w = max(head_rgb.shape[1], bottom_rgb.shape[1])
-
-        def _pad_width(rgb, width):
-            if rgb.shape[1] == width:
-                return rgb
-            if rgb.shape[1] > width:
-                return rgb[:, :width, :]
-            pad_w = width - rgb.shape[1]
-            return np.pad(rgb, ((0, 0), (0, pad_w), (0, 0)), mode="constant")
-
-        head_rgb = _pad_width(head_rgb, target_w)
-        bottom_rgb = _pad_width(bottom_rgb, target_w)
+        target_w = bottom_rgb.shape[1]
+        target_h = round(head_rgb.shape[0] * target_w / head_rgb.shape[1])
+        head_rgb = cv2.resize(
+            head_rgb,
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
         return np.concatenate([head_rgb, bottom_rgb], axis=0)
 
     # =========================================================== Init Task Env ===========================================================
