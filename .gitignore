@@ -130,6 +130,9 @@ target/
 # Third party
 # Jupyter Notebook
 .ipynb_checkpoints
+/third_party/RoboTwin/assets
+/third_party/RoboTwin/task_config
+/third_party/RoboTwin/policy/fastwam_policy
 
 # IPython
 profile_default/
