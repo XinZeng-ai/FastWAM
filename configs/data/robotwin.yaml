@@ -24,6 +24,7 @@ train:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames
+  verify_episode_files: false # 跳过数十万个数据全量路径检查
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01
@@ -87,6 +88,7 @@ val:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames
+  verify_episode_files: false
   video_size: [384, 320] # final resize video
   camera_key: null
   val_set_proportion: 0.01

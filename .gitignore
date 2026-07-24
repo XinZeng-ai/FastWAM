@@ -16,6 +16,7 @@ evaluate_results/
 .claude/
 
 # Data types
+*.pdf
 *.jit
 *.pt
 *.hdr
