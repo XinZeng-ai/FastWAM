@@ -32,7 +32,7 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   timing_enabled: false
-  skip_get_obs_within_replan: true
+  skip_get_obs_within_replan: false
 
   # Runtime inputs
   dataset_stats_path: null
