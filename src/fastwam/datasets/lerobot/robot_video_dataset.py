@@ -38,6 +38,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         is_training_set=False,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
+        verify_episode_files: bool = True,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
@@ -51,6 +52,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            verify_episode_files=verify_episode_files,
         )
     
         self.num_frames = num_frames

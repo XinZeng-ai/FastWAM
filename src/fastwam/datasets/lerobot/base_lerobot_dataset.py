@@ -33,6 +33,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        verify_episode_files: bool = True,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -105,6 +106,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
+            verify_episode_files=verify_episode_files,
         )
         
         # HACK: lerobot 3.0 will fix this

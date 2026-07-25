@@ -355,6 +355,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         video_codec: Literal["h264", "hevc", "libsvtav1", "h264_nvenc"] = "libsvtav1", 
         is_compute_episode_stats_image: bool = True,
+        verify_episode_files: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -489,7 +490,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         try:
             if force_cache_sync:
                 raise FileNotFoundError
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+            if verify_episode_files and not all(
+                (self.root / fpath).is_file() for fpath in self.get_episodes_file_paths()
+            ):
+                raise FileNotFoundError(
+                    f"One or more episode files are missing under dataset root: {self.root}"
+                )
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             # self.revision = get_safe_version(self.repo_id, self.revision)
@@ -1091,6 +1097,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
+        verify_episode_files: bool = True,
     ):
         super().__init__()
         self.dataset_dirs = dataset_dirs
@@ -1113,6 +1120,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                     tolerance_s=self.tolerances_s[ds_name],
                     download_videos=download_videos,
                     video_backend=video_backend,
+                    verify_episode_files=verify_episode_files,
                 )
                 self._datasets.append(_dataset)
             except Exception as e:
