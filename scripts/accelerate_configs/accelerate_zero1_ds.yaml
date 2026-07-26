@@ -4,6 +4,8 @@ distributed_type: DEEPSPEED
 deepspeed_config:
   deepspeed_config_file: scripts/ds_configs/ds_zero1_config.json
   zero3_init_flag: false
+  deepspeed_multinode_launcher: nossh
+  deepspeed_hostfile: /etc/mpi/hostfile
 
 # Keep this null when using deepspeed_config_file; precision is controlled by
 # training config (Trainer -> Accelerator(mixed_precision=...)) and DS JSON.

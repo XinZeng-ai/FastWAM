@@ -107,9 +107,16 @@ fi
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
+# accelerate launch 的 --num_processes 是 **全局总进程数**;多机时必须传 nnodes×nproc/node。
+TOTAL_PROCESSES=$(( NUM_MACHINES * NPROC_PER_NODE ))
+
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
+  --num_machines "${NUM_MACHINES}" \
+  --machine_rank "${MACHINE_RANK}" \
+  --main_process_ip "${MAIN_PROCESS_IP}" \
+  --main_process_port "${MAIN_PROCESS_PORT}" \
+  --num_processes "${TOTAL_PROCESSES}" \
   scripts/train.py \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
   "wandb.name=${TASK_BASENAME}" \

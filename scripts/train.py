@@ -1,3 +1,7 @@
+import sys
+
+sys.argv = [a for a in sys.argv if not a.startswith("--local_rank")]
+
 import hydra
 from omegaconf import DictConfig
 
