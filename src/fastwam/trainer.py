@@ -43,6 +43,7 @@ class Wan22Trainer:
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        self.eval_num_samples = int(cfg.get("eval_num_samples", 1))
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -382,168 +383,203 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
+        N = max(1, self.eval_num_samples)
+        num_frames_per_window = self.val_dataset.num_frames  # 33
+
+        # --- Select one val episode and N continuous non-overlapping windows ---
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
-        sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+        lerobot_ds = self.val_dataset.lerobot_dataset
+        ep_data_index = lerobot_ds.episode_data_index
+        num_episodes = len(ep_data_index["from"])
+        ep_id = torch.randint(0, num_episodes, (1,), generator=rng).item()
+        ep_start = int(ep_data_index["from"][ep_id].item())
+        ep_end = int(ep_data_index["to"][ep_id].item())
+        ep_length = ep_end - ep_start
 
-        # 1. training loss
-        with self.accelerator.autocast():
-            val_loss, _ = model.training_loss(sample)
-            val_loss = val_loss.float().item()
-        
-        prompt = sample["prompt"][0]
-        video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
-        action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
-        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
-        _, num_frames, _, _ = video0.shape
+        max_windows = ep_length // num_frames_per_window
+        N = min(N, max(1, max_windows))
+        if max_windows == 0:
+            logger.warning(
+                "Eval episode %d too short (%d frames < %d); using single padded window.",
+                ep_id, ep_length, num_frames_per_window,
+            )
+            N = 1
 
-        # 2. inference and video saving
-        infer_kwargs = {
-            "input_image": input_image,
-            "num_frames": num_frames,
-            "action": action,
-            "action_horizon": sample['action_horizon'],
-            "proprio": proprio,
-            "text_cfg_scale": 1.0,
-            "action_cfg_scale": 1.0,
-            "num_inference_steps": self.eval_num_inference_steps,
-            "seed": 42,
-            "tiled": False,
-        }
-        if sample["context"] is not None:
-            infer_kwargs["prompt"] = None
-            infer_kwargs["context"] = sample["context"][0]
-            infer_kwargs["context_mask"] = sample["context_mask"][0]
-        else:
-            infer_kwargs["prompt"] = prompt
+        max_offset = max(0, ep_length - N * num_frames_per_window)
+        offset = torch.randint(0, max_offset + 1, (1,), generator=rng).item()
+        window_indices = [ep_start + offset + k * num_frames_per_window for k in range(N)]
 
-        pred = model.infer(
-            **infer_kwargs,
-        )
-        
-        pred_video = pred["video"]
-        pred_action = pred.get("action", None)
+        # --- Accumulators ---
+        all_val_losses = []
+        all_psnr_rg = []
+        all_ssim_rg = []
+        all_psnr_rd = []
+        all_ssim_rd = []
+        all_psnr_dg = []
+        all_ssim_dg = []
+        all_action_l2 = []
+        all_action_l1 = []
+        all_stitched_frames = []
 
-        # 3. inference metrics against GT video
-        pred_video_tensor = pil_frames_to_video_tensor(pred_video)
-        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+        processor = lerobot_ds.processor
 
-        assert pred_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval infer prediction/GT shape mismatch: "
-            f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
+        for w_idx, eval_index in enumerate(window_indices):
+            sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
-        psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
-        ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+            # 1. training loss
+            with self.accelerator.autocast():
+                val_loss, _ = model.training_loss(sample)
+                val_loss = val_loss.float().item()
+            all_val_losses.append(val_loss)
 
-        action_l1 = None
-        action_l2 = None
-        if action is not None and pred_action is not None:
-            if sample["proprio"] is None:
-                raise ValueError("Eval sample must contain `proprio` for action denormalization.")
-            proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
-            
-            processor = self.val_dataset.lerobot_dataset.processor
+            prompt = sample["prompt"][0]
+            video0 = sample["video"][0]
+            action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
+            proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None
+            input_image = video0[:, 0].unsqueeze(0)
+            _, num_video_frames, _, _ = video0.shape
 
-            denorm_actions = {}
-            action_meta = processor.shape_meta["action"]
-            state_meta = processor.shape_meta["state"]
-            for action_name, raw_action in (("pred", pred_action), ("gt", action)):
-                if not isinstance(raw_action, torch.Tensor):
-                    raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
-                if raw_action.ndim == 2:
-                    action_btd = raw_action.unsqueeze(0)
-                elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
-                    action_btd = raw_action
-                else:
+            # 2. inference
+            infer_kwargs = {
+                "input_image": input_image,
+                "num_frames": num_video_frames,
+                "action": action,
+                "action_horizon": sample['action_horizon'],
+                "proprio": proprio,
+                "text_cfg_scale": 1.0,
+                "action_cfg_scale": 1.0,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "tiled": False,
+            }
+            if sample["context"] is not None:
+                infer_kwargs["prompt"] = None
+                infer_kwargs["context"] = sample["context"][0]
+                infer_kwargs["context_mask"] = sample["context_mask"][0]
+            else:
+                infer_kwargs["prompt"] = prompt
+
+            pred = model.infer(**infer_kwargs)
+            pred_video = pred["video"]
+            pred_action = pred.get("action", None)
+
+            # 3. inference metrics against GT video
+            pred_video_tensor = pil_frames_to_video_tensor(pred_video)
+            gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+
+            assert pred_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval infer prediction/GT shape mismatch: "
+                f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
+
+            all_psnr_rg.append(video_psnr(pred=pred_video_tensor, target=gt_video_tensor))
+            all_ssim_rg.append(video_ssim(pred=pred_video_tensor, target=gt_video_tensor))
+
+            # action metrics
+            if action is not None and pred_action is not None:
+                if sample["proprio"] is None:
+                    raise ValueError("Eval sample must contain `proprio` for action denormalization.")
+                proprio_full = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
+
+                action_meta = processor.shape_meta["action"]
+                state_meta = processor.shape_meta["state"]
+                denorm_actions = {}
+                for action_name, raw_action in (("pred", pred_action), ("gt", action)):
+                    if not isinstance(raw_action, torch.Tensor):
+                        raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
+                    if raw_action.ndim == 2:
+                        action_btd = raw_action.unsqueeze(0)
+                    elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
+                        action_btd = raw_action
+                    else:
+                        raise ValueError(
+                            f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                        )
+                    action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
+
+                    batch = {
+                        "action": action_btd,
+                        "state": proprio_full,
+                    }
+                    batch = processor.action_state_merger.backward(batch)
+                    batch = processor.normalizer.backward(batch)
+                    merged_batch = {
+                        "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
+                        "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
+                    }
+                    merged_batch = processor.action_state_merger.forward(merged_batch)
+                    denorm_action = merged_batch["action"].unsqueeze(0)
+                    if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
+                        raise ValueError(
+                            f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
+                        )
+                    denorm_actions[action_name] = denorm_action
+
+                pred_action_denorm = denorm_actions["pred"]
+                gt_action_denorm = denorm_actions["gt"]
+
+                if pred_action_denorm.shape != gt_action_denorm.shape:
                     raise ValueError(
-                        f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                        "Predicted action/GT action shape mismatch after denormalization: "
+                        f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
                     )
-                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
+                action_diff = pred_action_denorm - gt_action_denorm
+                all_action_l1.append(action_diff.abs().mean().item())
+                all_action_l2.append(action_diff.pow(2).mean().item())
 
-                batch = {
-                    "action": action_btd,
-                    "state": proprio,
-                }
-                batch = processor.action_state_merger.backward(batch)
-                batch = processor.normalizer.backward(batch)
-                merged_batch = {
-                    "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
-                    "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
-                }
-                merged_batch = processor.action_state_merger.forward(merged_batch)
-                denorm_action = merged_batch["action"].unsqueeze(0)
-                if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
-                    raise ValueError(
-                        f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
-                    )
-                denorm_actions[action_name] = denorm_action
+            # 4. VAE reconstruction metrics
+            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+            vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+            vae_recon_video = model._decode_latents(vae_latents, tiled=False)
+            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
 
-            pred_action_denorm = denorm_actions["pred"]
-            gt_action_denorm = denorm_actions["gt"]
+            assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval VAE reconstruction/GT shape mismatch: "
+                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
 
-            if pred_action_denorm.shape != gt_action_denorm.shape:
-                raise ValueError(
-                    "Predicted action/GT action shape mismatch after denormalization: "
-                    f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
-                )
-            action_diff = pred_action_denorm - gt_action_denorm
-            action_l1 = action_diff.abs().mean().item()
-            action_l2 = action_diff.pow(2).mean().item()
+            all_psnr_dg.append(video_psnr(pred=vae_video_tensor, target=gt_video_tensor))
+            all_ssim_dg.append(video_ssim(pred=vae_video_tensor, target=gt_video_tensor))
+            all_psnr_rd.append(video_psnr(pred=pred_video_tensor, target=vae_video_tensor))
+            all_ssim_rd.append(video_ssim(pred=pred_video_tensor, target=vae_video_tensor))
 
-        # 4. VAE reconstruction metrics against GT video
-        gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-        vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-        vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-        vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+            # 5. Stitch [pred | vae | gt] horizontally, accumulate frames
+            stitched_video_tensor = torch.cat(
+                [pred_video_tensor, vae_video_tensor, gt_video_tensor],
+                dim=3,
+            ).contiguous()
+            for t in range(stitched_video_tensor.shape[1]):
+                frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+                all_stitched_frames.append(Image.fromarray(frame))
 
-        assert vae_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval VAE reconstruction/GT shape mismatch: "
-            f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
-
-        psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
-        ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
-
-        psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-        ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
-
-        stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-            dim=2,
-        ).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
-
+        # --- Save single mp4 with all N windows concatenated in time ---
         video_path = os.path.join(
             self.eval_dir,
             f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
         )
-        save_mp4(stitched_frames, video_path, fps=8)
+        save_mp4(all_stitched_frames, video_path, fps=8)
 
+        # --- Average metrics across N windows ---
+        has_action = len(all_action_l2) > 0
         local_metrics = torch.tensor(
             [
-                float(val_loss),
-                float(psnr_rollout_vs_gt),
-                float(ssim_rollout_vs_gt),
-                float(psnr_rollout_vs_decode),
-                float(ssim_rollout_vs_decode),
-                float(psnr_decode_vs_gt),
-                float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
+                sum(all_val_losses) / N,
+                sum(all_psnr_rg) / N,
+                sum(all_ssim_rg) / N,
+                sum(all_psnr_rd) / N,
+                sum(all_ssim_rd) / N,
+                sum(all_psnr_dg) / N,
+                sum(all_ssim_dg) / N,
+                (sum(all_action_l2) / len(all_action_l2)) if has_action else -1.0,
+                (sum(all_action_l1) / len(all_action_l1)) if has_action else -1.0,
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
         ).unsqueeze(0)
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        action_l2_mean = gathered_metrics[:, 7].mean().item() if has_action else None
+        action_l1_mean = gathered_metrics[:, 8].mean().item() if has_action else None
 
         if was_dit_training:
             self._set_dit_only_train_mode()
