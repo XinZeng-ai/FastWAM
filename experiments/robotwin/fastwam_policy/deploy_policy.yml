@@ -24,3 +24,8 @@ rand_device: cpu
 tiled: false
 timing_enabled: false
 skip_get_obs_within_replan: false
+save_predicted_video: false
+predicted_video_native_fps: 8
+predicted_video_max_episodes: 1
+predicted_video_max_replans: 0
+predicted_video_save_comparison: true

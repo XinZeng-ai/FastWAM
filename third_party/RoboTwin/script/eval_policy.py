@@ -212,6 +212,16 @@ def main(usr_args, model=None):
 
     if model is None:
         model = get_model(usr_args)
+    configure_evaluation_output = getattr(
+        model,
+        "configure_evaluation_output",
+        None,
+    )
+    if callable(configure_evaluation_output):
+        configure_evaluation_output(
+            eval_output_dir=str(save_dir),
+            task_config=str(task_config),
+        )
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -222,6 +232,13 @@ def main(usr_args, model=None):
                                    instruction_type=instruction_type,
                                    skip_get_obs_within_replan=skip_get_obs_within_replan)
     suc_nums.append(suc_num)
+    finalize_evaluation_output = getattr(
+        model,
+        "finalize_evaluation_output",
+        None,
+    )
+    if callable(finalize_evaluation_output):
+        finalize_evaluation_output()
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
 

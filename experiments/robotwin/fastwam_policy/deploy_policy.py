@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import inspect
+import json
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -13,7 +14,7 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -26,6 +27,7 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.utils.video_io import save_mp4
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,93 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _frame_to_rgb_array(frame: Any) -> np.ndarray:
+    if isinstance(frame, Image.Image):
+        array = np.asarray(frame.convert("RGB"), dtype=np.uint8)
+    else:
+        array = np.asarray(frame)
+        if array.ndim == 4 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim == 3 and array.shape[0] == 3 and array.shape[-1] != 3:
+            array = np.transpose(array, (1, 2, 0))
+        if np.issubdtype(array.dtype, np.floating):
+            if float(array.min()) >= 0.0 and float(array.max()) <= 1.01:
+                array = array * 255.0
+            elif float(array.min()) >= -1.01 and float(array.max()) <= 1.01:
+                array = (array + 1.0) * 127.5
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError(f"Expected RGB frame [H,W,3], got {array.shape}")
+    return np.ascontiguousarray(array)
+
+
+def _write_rgb_video(path: Path, frames: list[np.ndarray], fps: float) -> None:
+    if len(frames) == 0:
+        raise ValueError(f"Cannot save an empty video: {path}")
+    if fps <= 0:
+        raise ValueError(f"`fps` must be positive, got {fps}")
+
+    normalized = [_frame_to_rgb_array(frame) for frame in frames]
+    height, width = normalized[0].shape[:2]
+    for frame in normalized:
+        if frame.shape[:2] != (height, width):
+            raise ValueError(
+                f"Video frame size mismatch: expected {(height, width)}, got {frame.shape[:2]}"
+            )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    try:
+        # Reuse the same imageio/FFMPEG writer as training validation.
+        save_mp4(
+            [Image.fromarray(frame, mode="RGB") for frame in normalized],
+            str(tmp_path),
+            fps=fps,
+        )
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _make_comparison_frames(
+    predicted_frames: list[np.ndarray],
+    rollout_frames: list[np.ndarray],
+    step_offsets: Optional[list[int]] = None,
+) -> list[np.ndarray]:
+    frame_count = min(len(rollout_frames), len(predicted_frames))
+    if step_offsets is None:
+        step_offsets = list(range(frame_count))
+    if len(step_offsets) < frame_count:
+        raise ValueError(
+            f"`step_offsets` has {len(step_offsets)} entries for {frame_count} frames."
+        )
+    comparison: list[np.ndarray] = []
+    for frame_idx in range(frame_count):
+        step_offset = int(step_offsets[frame_idx])
+        rollout = Image.fromarray(_frame_to_rgb_array(rollout_frames[frame_idx]))
+        predicted = Image.fromarray(_frame_to_rgb_array(predicted_frames[frame_idx]))
+        if rollout.size != predicted.size:
+            rollout = rollout.resize(predicted.size, resample=Image.BILINEAR)
+        canvas = Image.new("RGB", (predicted.width * 2, predicted.height))
+        canvas.paste(predicted, (0, 0))
+        canvas.paste(rollout, (predicted.width, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle((0, 0, predicted.width, 20), fill=(0, 0, 0))
+        draw.rectangle(
+            (predicted.width, 0, predicted.width * 2, 20),
+            fill=(0, 0, 0),
+        )
+        draw.text((5, 4), f"model prediction | step {step_offset}", fill=(255, 255, 255))
+        draw.text(
+            (predicted.width + 5, 4),
+            f"rollout observation | step {step_offset}",
+            fill=(255, 255, 255),
+        )
+        comparison.append(np.asarray(canvas, dtype=np.uint8))
+    return comparison
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -155,6 +244,12 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        action_video_freq_ratio: int,
+        save_predicted_video: bool,
+        predicted_video_native_fps: int,
+        predicted_video_max_episodes: int,
+        predicted_video_max_replans: int,
+        predicted_video_save_comparison: bool,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -178,18 +273,58 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self._action_video_freq_ratio = int(action_video_freq_ratio)
+        self.save_predicted_video = bool(save_predicted_video)
+        self.predicted_video_native_fps = int(predicted_video_native_fps)
+        self.predicted_video_max_episodes = int(predicted_video_max_episodes)
+        self.predicted_video_max_replans = int(predicted_video_max_replans)
+        self.predicted_video_save_comparison = bool(predicted_video_save_comparison)
+
+        if self._action_video_freq_ratio <= 0:
+            raise ValueError(
+                "`action_video_freq_ratio` must be positive, got "
+                f"{self._action_video_freq_ratio}"
+            )
+        if self.predicted_video_native_fps <= 0:
+            raise ValueError(
+                "`predicted_video_native_fps` must be positive, got "
+                f"{self.predicted_video_native_fps}"
+            )
+        if self.predicted_video_max_episodes < 0:
+            raise ValueError("`predicted_video_max_episodes` must be >= 0.")
+        if self.predicted_video_max_replans < 0:
+            raise ValueError("`predicted_video_max_replans` must be >= 0.")
+        if self.save_predicted_video:
+            supports_joint_video = (
+                hasattr(self.model, "infer_joint")
+                and "num_video_frames"
+                in inspect.signature(self.model.infer_action).parameters
+            )
+            if not supports_joint_video:
+                raise ValueError(
+                    "Predicted-video saving requires a joint/IDM model whose "
+                    "`infer_action` accepts `num_video_frames`; the selected model "
+                    f"is {type(self.model).__name__}."
+                )
 
         self.pending_actions: deque[np.ndarray] = deque()
-        self.episode_count = 0
+        self.episode_count = -1
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._prediction_output_root: Optional[Path] = None
+        self._prediction_phase: Optional[str] = None
+        self._prediction_replan_index = 0
+        self._active_prediction: Optional[dict[str, Any]] = None
+        self._episode_prediction: Optional[dict[str, Any]] = None
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
+            "horizon=%d | replan=%d | save_predicted_video=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.save_predicted_video,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -218,20 +353,263 @@ class WorldActionRobotWinPolicy:
         denorm = normalizer.backward(action.to(dtype=torch.float32, device="cpu"))
         return denorm.numpy()
 
-    def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
+    def _build_robotwin_rgb(self, observation: Dict[str, Any]) -> np.ndarray:
         obs_data = observation["observation"]
         head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
         left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
         right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
         bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+        return np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
 
+    def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
+        image = self._build_robotwin_rgb(observation)
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
             device=self.model.device,
             dtype=self.model.torch_dtype,
         )
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
+
+    def configure_evaluation_output(
+        self,
+        eval_output_dir: str,
+        task_config: str,
+    ) -> None:
+        """Set task/phase output context; called once before every eval phase."""
+        self._finalize_active_prediction()
+        self._flush_episode_prediction()
+        phase = "randomized" if "randomized" in str(task_config).lower() else "clean"
+        self._prediction_phase = phase
+        self._prediction_output_root = (
+            Path(eval_output_dir).expanduser().resolve()
+            / "predicted_videos"
+            / phase
+        )
+        self.episode_count = -1
+        self._prediction_replan_index = 0
+
+    def _should_save_current_prediction(self) -> bool:
+        if not self.save_predicted_video or self._prediction_output_root is None:
+            return False
+        if (
+            self.predicted_video_max_episodes > 0
+            and self.episode_count >= self.predicted_video_max_episodes
+        ):
+            return False
+        if (
+            self.predicted_video_max_replans > 0
+            and self._prediction_replan_index >= self.predicted_video_max_replans
+        ):
+            return False
+        return True
+
+    def _save_prediction_clip(
+        self,
+        predicted_video: list[Any],
+        observation: Dict[str, Any],
+    ) -> None:
+        if self._prediction_output_root is None:
+            return
+
+        native_frames = [_frame_to_rgb_array(frame) for frame in predicted_video]
+        expected_native_frames = (
+            self.action_horizon // self._action_video_freq_ratio + 1
+        )
+        if len(native_frames) != expected_native_frames:
+            logger.warning(
+                "Predicted video/action timeline mismatch: native=%d ratio=%d "
+                "expected_native=%d action_horizon=%d",
+                len(native_frames),
+                self._action_video_freq_ratio,
+                expected_native_frames,
+                self.action_horizon,
+            )
+
+        if (
+            self._episode_prediction is None
+            or self._episode_prediction["episode_index"] != self.episode_count
+        ):
+            self._episode_prediction = {
+                "episode_index": self.episode_count,
+                "phase": self._prediction_phase,
+                "native_frames": [],
+                "comparison_frames": [],
+                "replans": [],
+            }
+
+        episode_prediction = self._episode_prediction
+        native_start = len(episode_prediction["native_frames"])
+        episode_prediction["native_frames"].extend(native_frames)
+        replan_record = {
+            "replan_index": self._prediction_replan_index,
+            "native_model_frames": len(native_frames),
+            "native_action_step_offsets": [
+                idx * self._action_video_freq_ratio
+                for idx in range(len(native_frames))
+            ],
+            "prediction_episode_video_frame_range": [
+                native_start,
+                native_start + len(native_frames),
+            ],
+            "action_horizon": self.action_horizon,
+            "executed_replan_steps": self.replan_steps,
+            "comparison_frames": 0,
+            "comparison_episode_video_frame_range": None,
+        }
+        episode_prediction["replans"].append(replan_record)
+
+        self._active_prediction = {
+            "native_frames": native_frames,
+            "max_rollout_frames": (
+                (len(native_frames) - 1) * self._action_video_freq_ratio + 1
+            ),
+            "rollout_frames": [self._build_robotwin_rgb(observation)],
+            "replan_record": replan_record,
+        }
+
+    def _append_rollout_observation(self, observation: Dict[str, Any]) -> None:
+        if self._active_prediction is None:
+            return
+        rollout_frames = self._active_prediction["rollout_frames"]
+        max_rollout_frames = int(self._active_prediction["max_rollout_frames"])
+        if len(rollout_frames) < max_rollout_frames:
+            rollout_frames.append(self._build_robotwin_rgb(observation))
+
+    def _finalize_active_prediction(self) -> None:
+        active = self._active_prediction
+        self._active_prediction = None
+        if active is None or not self.predicted_video_save_comparison:
+            return
+        try:
+            rollout_frames = active["rollout_frames"]
+            native_frames = active["native_frames"]
+            native_step_offsets = list(
+                range(
+                    0,
+                    len(rollout_frames),
+                    self._action_video_freq_ratio,
+                )
+            )
+            native_rollout_frames = [
+                rollout_frames[offset] for offset in native_step_offsets
+            ]
+            native_comparison = _make_comparison_frames(
+                native_frames,
+                native_rollout_frames,
+                step_offsets=native_step_offsets,
+            )
+            if self._episode_prediction is None:
+                raise RuntimeError(
+                    "Missing episode prediction accumulator while finalizing replan."
+                )
+            comparison_start = len(
+                self._episode_prediction["comparison_frames"]
+            )
+            self._episode_prediction["comparison_frames"].extend(
+                native_comparison
+            )
+            replan_record = active["replan_record"]
+            replan_record["comparison_frames"] = len(native_comparison)
+            replan_record["comparison_action_step_offsets"] = (
+                native_step_offsets[: len(native_comparison)]
+            )
+            replan_record["comparison_episode_video_frame_range"] = [
+                comparison_start,
+                comparison_start + len(native_comparison),
+            ]
+        except Exception:
+            logger.exception(
+                "Failed to finalize predicted-video comparison; continuing evaluation."
+            )
+
+    def _flush_episode_prediction(self) -> None:
+        episode_prediction = self._episode_prediction
+        self._episode_prediction = None
+        if episode_prediction is None or self._prediction_output_root is None:
+            return
+
+        try:
+            episode_index = int(episode_prediction["episode_index"])
+            phase = str(episode_prediction["phase"])
+            native_frames = episode_prediction["native_frames"]
+            comparison_frames = episode_prediction["comparison_frames"]
+            output_prefix = (
+                self._prediction_output_root
+                / f"episode_{episode_index:03d}_{phase}"
+            )
+            prediction_path = output_prefix.with_name(
+                f"{output_prefix.name}_prediction_native_9f_per_replan.mp4"
+            )
+            comparison_path = output_prefix.with_name(
+                f"{output_prefix.name}_comparison_native_7f_per_replan.mp4"
+            )
+
+            if len(native_frames) > 0:
+                _write_rgb_video(
+                    prediction_path,
+                    native_frames,
+                    fps=self.predicted_video_native_fps,
+                )
+            if len(comparison_frames) > 0:
+                _write_rgb_video(
+                    comparison_path,
+                    comparison_frames,
+                    fps=self.predicted_video_native_fps,
+                )
+
+            metadata = {
+                "phase": phase,
+                "episode_index": episode_index,
+                "native_frames_per_replan": self._num_video_frames,
+                "comparison_frames_per_full_replan": (
+                    self.replan_steps // self._action_video_freq_ratio + 1
+                ),
+                "saved_replans": len(episode_prediction["replans"]),
+                "prediction_total_frames": len(native_frames),
+                "comparison_total_frames": len(comparison_frames),
+                "native_fps": self.predicted_video_native_fps,
+                "temporal_interpolation": False,
+                "prediction_video": prediction_path.name,
+                "comparison_video": comparison_path.name,
+                "comparison_note": (
+                    "Each replan is concatenated in time. Left is the model "
+                    "prediction; right is the model-input rollout observation "
+                    "before the aligned action."
+                ),
+                "rollout_alignment": (
+                    "Native prediction frame i aligns to the rollout observation "
+                    "before action offset i*action_video_freq_ratio."
+                ),
+                "action_video_freq_ratio": self._action_video_freq_ratio,
+                "replans": episode_prediction["replans"],
+            }
+            metadata_path = output_prefix.with_name(
+                f"{output_prefix.name}_predicted_video_metadata.json"
+            )
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(
+                "Saved episode-level predicted videos | episode=%d phase=%s "
+                "replans=%d prediction_frames=%d comparison_frames=%d dir=%s",
+                episode_index,
+                phase,
+                len(episode_prediction["replans"]),
+                len(native_frames),
+                len(comparison_frames),
+                self._prediction_output_root,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to save episode-level predicted videos; continuing evaluation."
+            )
+
+    def finalize_evaluation_output(self) -> None:
+        """Flush the final episode when a clean/randomized phase finishes."""
+        self._finalize_active_prediction()
+        self._flush_episode_prediction()
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
@@ -254,11 +632,28 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        save_this_prediction = self._should_save_current_prediction()
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            if save_this_prediction:
+                pred = self.model.infer_joint(**infer_kwargs)
+            else:
+                pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+
+        if save_this_prediction:
+            try:
+                self._save_prediction_clip(pred["video"], observation)
+            except Exception:
+                logger.exception(
+                    "Failed to save predicted video for episode=%d replan=%d; "
+                    "continuing evaluation.",
+                    self.episode_count,
+                    self._prediction_replan_index,
+                )
+                self._active_prediction = None
+        self._prediction_replan_index += 1
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -280,8 +675,13 @@ class WorldActionRobotWinPolicy:
                     "Observation is required when action queue is empty "
                     "(replan step for fastwam)."
                 )
+            if self._active_prediction is not None:
+                self._append_rollout_observation(observation)
+                self._finalize_active_prediction()
             instruction = task_env.get_instruction()
             self._fill_action_queue(observation=observation, instruction=instruction)
+        elif observation is not None:
+            self._append_rollout_observation(observation)
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -305,8 +705,11 @@ class WorldActionRobotWinPolicy:
         }
 
     def reset(self) -> None:
+        self._finalize_active_prediction()
+        self._flush_episode_prediction()
         self.pending_actions.clear()
         self.episode_count += 1
+        self._prediction_replan_index = 0
         self.step_count = 0
         self.reset_timing_rollout()
 
@@ -368,6 +771,53 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    save_predicted_video = _parse_bool(
+        usr_args.get(
+            "save_predicted_video",
+            cfg.EVALUATION.get("save_predicted_video", False),
+        )
+    )
+    predicted_video_native_fps = int(
+        usr_args.get(
+            "predicted_video_native_fps",
+            cfg.EVALUATION.get("predicted_video_native_fps", 8),
+        )
+    )
+    predicted_video_max_episodes = int(
+        usr_args.get(
+            "predicted_video_max_episodes",
+            cfg.EVALUATION.get("predicted_video_max_episodes", 1),
+        )
+    )
+    predicted_video_max_replans = int(
+        usr_args.get(
+            "predicted_video_max_replans",
+            cfg.EVALUATION.get("predicted_video_max_replans", 0),
+        )
+    )
+    predicted_video_save_comparison = _parse_bool(
+        usr_args.get(
+            "predicted_video_save_comparison",
+            cfg.EVALUATION.get("predicted_video_save_comparison", True),
+        )
+    )
+    skip_get_obs_within_replan = _parse_bool(
+        usr_args.get(
+            "skip_get_obs_within_replan",
+            cfg.EVALUATION.get("skip_get_obs_within_replan", False),
+        )
+    )
+    if (
+        save_predicted_video
+        and predicted_video_save_comparison
+        and skip_get_obs_within_replan
+    ):
+        raise ValueError(
+            "Predicted-video rollout comparison requires "
+            "`skip_get_obs_within_replan=false` so every executed action offset "
+            "has an aligned observation."
+        )
+    action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -387,6 +837,12 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        action_video_freq_ratio=action_video_freq_ratio,
+        save_predicted_video=save_predicted_video,
+        predicted_video_native_fps=predicted_video_native_fps,
+        predicted_video_max_episodes=predicted_video_max_episodes,
+        predicted_video_max_replans=predicted_video_max_replans,
+        predicted_video_save_comparison=predicted_video_save_comparison,
     )
     return policy
 

@@ -34,6 +34,14 @@ EVALUATION:
   timing_enabled: false
   skip_get_obs_within_replan: false
 
+  # Joint/IDM future-video visualization. The model natively predicts 9 frames
+  # at action offsets [0,4,...,32]; no temporal interpolation is applied.
+  save_predicted_video: false
+  predicted_video_native_fps: 8
+  predicted_video_max_episodes: 1  # 0 means all episodes
+  predicted_video_max_replans: 0   # 0 means all replans in the saved episode
+  predicted_video_save_comparison: true
+
   # Runtime inputs
   dataset_stats_path: null
   device: cuda

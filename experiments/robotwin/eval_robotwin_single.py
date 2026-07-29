@@ -239,6 +239,31 @@ def main(cfg: DictConfig):
         "skip_get_obs_within_replan",
         cfg.EVALUATION.skip_get_obs_within_replan,
     )
+    _append_override(
+        overrides,
+        "save_predicted_video",
+        cfg.EVALUATION.save_predicted_video,
+    )
+    _append_override(
+        overrides,
+        "predicted_video_native_fps",
+        cfg.EVALUATION.predicted_video_native_fps,
+    )
+    _append_override(
+        overrides,
+        "predicted_video_max_episodes",
+        cfg.EVALUATION.predicted_video_max_episodes,
+    )
+    _append_override(
+        overrides,
+        "predicted_video_max_replans",
+        cfg.EVALUATION.predicted_video_max_replans,
+    )
+    _append_override(
+        overrides,
+        "predicted_video_save_comparison",
+        cfg.EVALUATION.predicted_video_save_comparison,
+    )
 
     cmd = [
         sys.executable,

@@ -379,6 +379,19 @@ def main(cfg: DictConfig) -> None:
         "skip_get_obs_within_replan": bool(
             cfg.EVALUATION.skip_get_obs_within_replan
         ),
+        "save_predicted_video": bool(cfg.EVALUATION.save_predicted_video),
+        "predicted_video_native_fps": int(
+            cfg.EVALUATION.predicted_video_native_fps
+        ),
+        "predicted_video_max_episodes": int(
+            cfg.EVALUATION.predicted_video_max_episodes
+        ),
+        "predicted_video_max_replans": int(
+            cfg.EVALUATION.predicted_video_max_replans
+        ),
+        "predicted_video_save_comparison": bool(
+            cfg.EVALUATION.predicted_video_save_comparison
+        ),
     }
 
     task_rates: dict[str, dict[str, float | None]] = {
