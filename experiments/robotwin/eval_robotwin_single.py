@@ -259,12 +259,6 @@ def main(cfg: DictConfig):
         "predicted_video_max_replans",
         cfg.EVALUATION.predicted_video_max_replans,
     )
-    _append_override(
-        overrides,
-        "predicted_video_save_comparison",
-        cfg.EVALUATION.predicted_video_save_comparison,
-    )
-
     cmd = [
         sys.executable,
         "-u",

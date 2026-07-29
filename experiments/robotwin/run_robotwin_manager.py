@@ -389,9 +389,6 @@ def main(cfg: DictConfig) -> None:
         "predicted_video_max_replans": int(
             cfg.EVALUATION.predicted_video_max_replans
         ),
-        "predicted_video_save_comparison": bool(
-            cfg.EVALUATION.predicted_video_save_comparison
-        ),
     }
 
     task_rates: dict[str, dict[str, float | None]] = {
