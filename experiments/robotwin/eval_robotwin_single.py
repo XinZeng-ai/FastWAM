@@ -11,7 +11,8 @@ Features:
 Common arguments:
 - `ckpt`: path to the FastWAM checkpoint (required).
 - `EVALUATION.task_name`: task name to evaluate (required).
-- `gpu_id`: sets `CUDA_VISIBLE_DEVICES`.
+- `gpu_id`: selects a logical GPU from the inherited `CUDA_VISIBLE_DEVICES`
+  list (or a physical GPU when that variable is unset).
 
 Examples:
 1) Minimal run
@@ -146,6 +147,25 @@ def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: b
     overrides.extend([f"--{key}", _format_override_value(value)])
 
 
+def _select_cuda_device(gpu_id: int, inherited_visible_devices: str | None) -> str:
+    """Resolve a logical worker GPU to one CUDA device for the child process."""
+    if inherited_visible_devices is None:
+        return str(gpu_id)
+
+    visible_devices = [
+        device.strip()
+        for device in inherited_visible_devices.split(",")
+        if device.strip()
+    ]
+    if gpu_id < 0 or gpu_id >= len(visible_devices):
+        raise ValueError(
+            f"`gpu_id={gpu_id}` is outside inherited CUDA_VISIBLE_DEVICES="
+            f"{inherited_visible_devices!r} (available logical GPU IDs: "
+            f"0..{len(visible_devices) - 1})."
+        )
+    return visible_devices[gpu_id]
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
@@ -183,14 +203,7 @@ def main(cfg: DictConfig):
     log_file = run_output_dir / (
         f"eval_{str(cfg.EVALUATION.task_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
-    robotwin_eval_base = (
-        PROJECT_ROOT
-        / "evaluate_results"
-        / "robotwin"
-        / ckpt_tag
-        / run_ts
-        / str(cfg.EVALUATION.task_name)
-    )
+    robotwin_eval_base = run_output_dir / str(cfg.EVALUATION.task_name)
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -238,8 +251,19 @@ def main(cfg: DictConfig):
     ]
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
+    inherited_visible_devices = env.get("CUDA_VISIBLE_DEVICES")
+    selected_cuda_device = _select_cuda_device(
+        int(cfg.gpu_id), inherited_visible_devices
+    )
+    env["CUDA_VISIBLE_DEVICES"] = selected_cuda_device
     env["PYTHONUNBUFFERED"] = "1"
+    print(
+        "GPU selection: "
+        f"inherited CUDA_VISIBLE_DEVICES={inherited_visible_devices!r}, "
+        f"logical gpu_id={int(cfg.gpu_id)}, "
+        f"child CUDA_VISIBLE_DEVICES={selected_cuda_device!r}",
+        flush=True,
+    )
 
     with open(log_file, "w", encoding="utf-8") as log_f:
         process = subprocess.Popen(
