@@ -102,7 +102,7 @@ def _result_suffix_from_task_config(task_config):
     )
 
 
-def main(usr_args):
+def main(usr_args, model=None):
     eval_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
@@ -210,7 +210,8 @@ def main(usr_args):
     test_num = eval_num_episodes
     topk = 1
 
-    model = get_model(usr_args)
+    if model is None:
+        model = get_model(usr_args)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -233,7 +234,7 @@ def main(usr_args):
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
     print(f"Data has been saved to {file_path}")
-    # return task_reward
+    return model
 
 
 def eval_policy(task_name,
