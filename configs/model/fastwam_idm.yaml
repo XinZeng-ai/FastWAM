@@ -3,6 +3,7 @@ model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_max_len: 128
 load_text_encoder: false
+vision_tokenizer_config: null
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
