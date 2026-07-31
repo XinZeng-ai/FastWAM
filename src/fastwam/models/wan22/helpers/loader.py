@@ -12,6 +12,7 @@ from .state_dict_converters import (
 from ..wan_video_dit import WanVideoDiT
 from ..wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
 from ..wan_video_vae import WanVideoVAE38
+from ..rae_video_tokenizer import create_framewise_rae_video_tokenizer
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -21,7 +22,7 @@ SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
 @dataclass
 class Wan22LoadedComponents:
     dit: WanVideoDiT
-    vae: WanVideoVAE38
+    vae: torch.nn.Module
     text_encoder: WanTextEncoder | None
     tokenizer: HuggingfaceTokenizer | None
     dit_path: str
@@ -117,7 +118,58 @@ def _load_registered_model(
     if state_dict_converter is not None:
         state_dict = state_dict_converter(state_dict)
 
-    model.load_state_dict(state_dict, strict=False)
+    if model_name == "wan_video_dit":
+        # A frame-wise RAE changes only the visual tokenizer boundary, hence the
+        # input Conv3d and video output head can have different channel shapes.
+        # PyTorch still raises on shape mismatches with strict=False, so filter
+        # explicitly and report every skipped tensor.
+        model_state = model.state_dict()
+        compatible = {}
+        unexpected = []
+        mismatched = {}
+        for key, value in state_dict.items():
+            if key not in model_state:
+                unexpected.append(key)
+            elif tuple(value.shape) != tuple(model_state[key].shape):
+                mismatched[key] = (tuple(value.shape), tuple(model_state[key].shape))
+            else:
+                compatible[key] = value
+        allowed_mismatch = {
+            "patch_embedding.weight",
+            "head.head.weight",
+            "head.head.bias",
+        }
+        disallowed_mismatch = sorted(set(mismatched) - allowed_mismatch)
+        if disallowed_mismatch:
+            raise RuntimeError(
+                f"Incompatible pretrained Wan video DiT checkpoint {path}: "
+                f"disallowed_shape_mismatch="
+                f"{ {key: mismatched[key] for key in disallowed_mismatch} }"
+            )
+        missing = sorted(set(model_state) - set(compatible))
+        expected_missing = sorted(set(missing) & allowed_mismatch)
+        disallowed_missing = sorted(set(missing) - allowed_mismatch)
+        if disallowed_missing:
+            raise RuntimeError(
+                f"Pretrained Wan video DiT checkpoint {path} is missing body weights: "
+                f"{disallowed_missing}"
+            )
+        model.load_state_dict(compatible, strict=False)
+        if unexpected:
+            logger.warning(
+                "Explicitly ignored pretrained Wan video DiT keys not present in "
+                "the configured model: %s",
+                sorted(unexpected),
+            )
+        if expected_missing:
+            logger.warning(
+                "Reinitialized shape-incompatible Wan video boundary tensors: %s; "
+                "checkpoint/current shapes=%s",
+                expected_missing,
+                {key: mismatched.get(key) for key in expected_missing},
+            )
+    else:
+        model.load_state_dict(state_dict, strict=False)
     model = model.to(device=device, dtype=torch_dtype)
     return model
 
@@ -148,6 +200,7 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    vision_tokenizer_config: dict[str, Any] | None = None,
 ):
     logger.info("Loading Wan2.2-TI2V-5B components...")
     start = time.time()
@@ -162,7 +215,8 @@ def load_wan22_ti2v_5b_components(
         redirect_common_files=redirect_common_files,
     )
 
-    vae_config.download_if_necessary()
+    if vision_tokenizer_config is None:
+        vae_config.download_if_necessary()
     if load_text_encoder:
         text_config.download_if_necessary()
         tokenizer_config.download_if_necessary()
@@ -207,7 +261,21 @@ def load_wan22_ti2v_5b_components(
             "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
             "training must provide cached `context/context_mask`."
         )
-    vae: WanVideoVAE38 = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
+    if vision_tokenizer_config is None:
+        vae: torch.nn.Module = _load_registered_model(
+            vae_config.path,
+            "wan_video_vae",
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+        vae_path = str(vae_config.path)
+    else:
+        vae = create_framewise_rae_video_tokenizer(
+            config=dict(vision_tokenizer_config),
+            device=device,
+            torch_dtype=torch_dtype,
+        )
+        vae_path = str(vae.checkpoint_paths)
     logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f seconds.", time.time() - start)
     return Wan22LoadedComponents(
         dit=dit,
@@ -215,7 +283,7 @@ def load_wan22_ti2v_5b_components(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         dit_path=dit_path,
-        vae_path=str(vae_config.path),
+        vae_path=vae_path,
         text_encoder_path=text_encoder_path,
         tokenizer_path=tokenizer_path,
     )

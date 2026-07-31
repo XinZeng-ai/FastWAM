@@ -134,6 +134,7 @@ target/
 /third_party/RoboTwin/assets
 /third_party/RoboTwin/task_config
 /third_party/RoboTwin/policy/fastwam_policy
+/third_party/dinov3/
 
 # IPython
 profile_default/

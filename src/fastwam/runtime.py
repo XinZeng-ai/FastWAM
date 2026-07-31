@@ -79,6 +79,7 @@ def create_fastwam(
     video_dit_config,
     tokenizer_max_len: int = 512,
     load_text_encoder: bool = True,
+    vision_tokenizer_config=None,
     proprio_dim: int | None = None,
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
@@ -97,6 +98,17 @@ def create_fastwam(
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
         raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+    if isinstance(vision_tokenizer_config, DictConfig):
+        vision_tokenizer_config = OmegaConf.to_container(
+            vision_tokenizer_config, resolve=True
+        )
+    if vision_tokenizer_config is not None and not isinstance(
+        vision_tokenizer_config, dict
+    ):
+        raise ValueError(
+            "`vision_tokenizer_config` must resolve to a dict or null, got "
+            f"{type(vision_tokenizer_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
@@ -140,6 +152,7 @@ def create_fastwam(
         tokenizer_model_id=tokenizer_model_id,
         tokenizer_max_len=int(tokenizer_max_len),
         load_text_encoder=bool(load_text_encoder),
+        vision_tokenizer_config=vision_tokenizer_config,
         proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
         redirect_common_files=bool(redirect_common_files),
         video_dit_config=video_dit_config,
@@ -164,6 +177,7 @@ def create_fastwam_joint(
     video_dit_config,
     tokenizer_max_len: int = 512,
     load_text_encoder: bool = True,
+    vision_tokenizer_config=None,
     proprio_dim: int | None = None,
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
@@ -182,6 +196,17 @@ def create_fastwam_joint(
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
         raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+    if isinstance(vision_tokenizer_config, DictConfig):
+        vision_tokenizer_config = OmegaConf.to_container(
+            vision_tokenizer_config, resolve=True
+        )
+    if vision_tokenizer_config is not None and not isinstance(
+        vision_tokenizer_config, dict
+    ):
+        raise ValueError(
+            "`vision_tokenizer_config` must resolve to a dict or null, got "
+            f"{type(vision_tokenizer_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
@@ -225,6 +250,7 @@ def create_fastwam_joint(
         tokenizer_model_id=tokenizer_model_id,
         tokenizer_max_len=int(tokenizer_max_len),
         load_text_encoder=bool(load_text_encoder),
+        vision_tokenizer_config=vision_tokenizer_config,
         proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
         redirect_common_files=bool(redirect_common_files),
         video_dit_config=video_dit_config,
@@ -249,6 +275,7 @@ def create_fastwam_idm(
     video_dit_config,
     tokenizer_max_len: int = 512,
     load_text_encoder: bool = True,
+    vision_tokenizer_config=None,
     proprio_dim: int | None = None,
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
@@ -269,6 +296,17 @@ def create_fastwam_idm(
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
         raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+    if isinstance(vision_tokenizer_config, DictConfig):
+        vision_tokenizer_config = OmegaConf.to_container(
+            vision_tokenizer_config, resolve=True
+        )
+    if vision_tokenizer_config is not None and not isinstance(
+        vision_tokenizer_config, dict
+    ):
+        raise ValueError(
+            "`vision_tokenizer_config` must resolve to a dict or null, got "
+            f"{type(vision_tokenizer_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
@@ -312,6 +350,7 @@ def create_fastwam_idm(
         tokenizer_model_id=tokenizer_model_id,
         tokenizer_max_len=int(tokenizer_max_len),
         load_text_encoder=bool(load_text_encoder),
+        vision_tokenizer_config=vision_tokenizer_config,
         proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
         redirect_common_files=bool(redirect_common_files),
         video_dit_config=video_dit_config,

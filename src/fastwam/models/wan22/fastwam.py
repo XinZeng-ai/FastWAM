@@ -96,6 +96,7 @@ class FastWAM(torch.nn.Module):
         tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
         tokenizer_max_len: int = 512,
         load_text_encoder: bool = True,
+        vision_tokenizer_config: dict[str, Any] | None = None,
         proprio_dim: Optional[int] = None,
         redirect_common_files: bool = True,
         video_dit_config: dict[str, Any] | None = None,
@@ -127,6 +128,7 @@ class FastWAM(torch.nn.Module):
             dit_config=video_dit_config,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
             load_text_encoder=load_text_encoder,
+            vision_tokenizer_config=vision_tokenizer_config,
         )
 
         video_expert = components.dit
@@ -1097,13 +1099,87 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
+    @staticmethod
+    def _load_checkpoint_state(
+        module: nn.Module,
+        checkpoint_state: dict[str, torch.Tensor],
+        *,
+        checkpoint_path,
+        component_name: str,
+        allowed_shape_mismatch: set[str],
+    ) -> list[str]:
+        """Load a checkpoint without letting ``strict=False`` hide bad shapes."""
+        model_state = module.state_dict()
+        compatible = {}
+        unexpected = []
+        mismatched = {}
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                unexpected.append(key)
+            elif tuple(value.shape) != tuple(model_state[key].shape):
+                mismatched[key] = (tuple(value.shape), tuple(model_state[key].shape))
+            else:
+                compatible[key] = value
+
+        disallowed_mismatch = sorted(set(mismatched) - allowed_shape_mismatch)
+        if disallowed_mismatch:
+            raise RuntimeError(
+                f"Incompatible {component_name} checkpoint {checkpoint_path}: "
+                "only the video input patch embedding and video output head may "
+                "change shape when switching visual tokenizers; got "
+                f"{ {key: mismatched[key] for key in disallowed_mismatch} }"
+            )
+
+        missing = sorted(set(model_state) - set(compatible))
+        module.load_state_dict(compatible, strict=False)
+        if unexpected:
+            logger.warning(
+                "Explicitly ignored %s checkpoint keys not present in the current model: %s",
+                component_name,
+                sorted(unexpected),
+            )
+        if missing:
+            logger.warning(
+                "Kept current initialization for %s checkpoint keys: %s",
+                component_name,
+                missing,
+            )
+        if mismatched:
+            logger.warning(
+                "Reinitialized shape-incompatible %s visual-boundary tensors: %s",
+                component_name,
+                mismatched,
+            )
+        return sorted(mismatched)
+
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        boundary_mismatch = []
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            boundary_mismatch = self._load_checkpoint_state(
+                self.mot,
+                payload["mot"],
+                checkpoint_path=path,
+                component_name="MoT",
+                allowed_shape_mismatch={
+                    "mixtures.video.patch_embedding.weight",
+                    "mixtures.video.head.head.weight",
+                    "mixtures.video.head.head.bias",
+                },
+            )
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
-            self.video_expert.load_state_dict(payload["dit"], strict=False)
+            boundary_mismatch = self._load_checkpoint_state(
+                self.video_expert,
+                payload["dit"],
+                checkpoint_path=path,
+                component_name="legacy video DiT",
+                allowed_shape_mismatch={
+                    "patch_embedding.weight",
+                    "head.head.weight",
+                    "head.head.bias",
+                },
+            )
         else:
             raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
         if self.proprio_encoder is not None:
@@ -1115,6 +1191,12 @@ class FastWAM(torch.nn.Module):
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
 
         if optimizer is not None and "optimizer" in payload:
+            if boundary_mismatch:
+                raise RuntimeError(
+                    "Refusing to restore optimizer state after visual-boundary shape "
+                    f"changes ({boundary_mismatch}). Load model weights without an "
+                    "optimizer and create a fresh optimizer instead."
+                )
             optimizer.load_state_dict(payload["optimizer"])
         return payload
 
