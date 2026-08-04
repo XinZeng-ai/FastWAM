@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -150,6 +151,11 @@ def _parse_success_rate(result_file: Path) -> float:
             continue
     if last_value is None:
         raise ValueError(f"Failed to parse success rate from: {result_file}")
+    if not math.isfinite(last_value) or not 0.0 <= last_value <= 1.0:
+        raise ValueError(
+            f"Invalid success rate in {result_file}: {last_value}; "
+            "expected a finite value in [0, 1]."
+        )
     return last_value
 
 
@@ -243,6 +249,40 @@ def _build_assignments(
     return assignments, estimated_loads
 
 
+def _rebalance_pending_assignments(
+    assignments: list[dict[str, Any]],
+    task_step_limits: dict[str, int],
+    num_workers: int,
+) -> tuple[list[list[dict[str, Any]]], list[int]]:
+    """Balance pending phases while keeping phases of one task serialized."""
+    assignments_by_task: dict[str, list[dict[str, Any]]] = {}
+    for assignment in assignments:
+        task_name = str(assignment["task_name"])
+        assignments_by_task.setdefault(task_name, []).append(assignment)
+
+    def assignment_load(assignment: dict[str, Any]) -> int:
+        task_name = str(assignment["task_name"])
+        return (
+            task_step_limits.get(task_name, 1)
+            * int(assignment["eval_num_episodes"])
+        )
+
+    buckets: list[list[dict[str, Any]]] = [[] for _ in range(num_workers)]
+    loads = [0 for _ in range(num_workers)]
+    ordered_task_assignments = sorted(
+        assignments_by_task.values(),
+        key=lambda group: sum(assignment_load(item) for item in group),
+        reverse=True,
+    )
+    for task_assignments in ordered_task_assignments:
+        worker_id = min(range(num_workers), key=lambda idx: loads[idx])
+        buckets[worker_id].extend(task_assignments)
+        loads[worker_id] += sum(
+            assignment_load(item) for item in task_assignments
+        )
+    return buckets, loads
+
+
 def _ensure_policy_symlink(robotwin_root: Path) -> None:
     source = (
         PROJECT_ROOT / "experiments" / "robotwin" / "fastwam_policy"
@@ -316,6 +356,13 @@ def main(cfg: DictConfig) -> None:
     run_output_dir = (
         PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     )
+    resume_existing = bool(cfg.EVALUATION.resume_existing)
+    if resume_existing and not run_output_dir.is_dir():
+        raise FileNotFoundError(
+            "Evaluation resume was requested, but the run directory does not "
+            f"exist: {run_output_dir}. Check EVAL_RUN_ID, TASK_CONFIG, and "
+            "CKPT_PATH."
+        )
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     manager_log = run_output_dir / "manager.log"
@@ -346,6 +393,35 @@ def main(cfg: DictConfig) -> None:
         task_episode_counts,
         num_workers,
     )
+    resumed_phases = 0
+    resumed_episodes = 0
+    if resume_existing:
+        pending_assignments: list[dict[str, Any]] = []
+        for assignments in assignments_by_worker:
+            for assignment in assignments:
+                task_name = str(assignment["task_name"])
+                phase = str(assignment["phase"])
+                result_file = (
+                    run_output_dir
+                    / task_name
+                    / _phase_result_filename(phase)
+                )
+                if result_file.exists():
+                    # A file is a completion marker only if its final success
+                    # rate is parseable and valid. Never silently skip a
+                    # malformed or partially written result.
+                    _parse_success_rate(result_file)
+                    resumed_phases += 1
+                    resumed_episodes += int(assignment["eval_num_episodes"])
+                    continue
+                pending_assignments.append(assignment)
+        assignments_by_worker, estimated_loads = (
+            _rebalance_pending_assignments(
+                pending_assignments,
+                task_step_limits,
+                num_workers,
+            )
+        )
     sim_task = HydraConfig.get().runtime.choices.get("task")
     base_args: dict[str, Any] = {
         "ckpt_setting": str(ckpt_path),
@@ -487,6 +563,13 @@ def main(cfg: DictConfig) -> None:
         f"episodes_per_phase={sum(task_episode_counts[t] for t in tasks)} "
         f"output_dir={run_output_dir}"
     )
+    if resume_existing:
+        total_phases = len(tasks) * 2
+        log(
+            f"resume enabled: skipped completed phases={resumed_phases}/"
+            f"{total_phases} completed_episodes={resumed_episodes}; "
+            f"pending_phases={total_phases - resumed_phases}"
+        )
 
     inherited_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     for worker_id, assignments in enumerate(assignments_by_worker):
@@ -535,7 +618,8 @@ def main(cfg: DictConfig) -> None:
             f"launch persistent worker gpu={gpu_id} "
             f"worker={gpu_worker_id} "
             f"physical_device={selected_device} "
-            f"tasks={len(assignments) // 2} "
+            f"tasks={len({a['task_name'] for a in assignments})} "
+            f"phases={len(assignments)} "
             f"estimated_steps={estimated_loads[worker_id]}"
         )
         process = subprocess.Popen(
@@ -621,15 +705,13 @@ def main(cfg: DictConfig) -> None:
         terminate_workers()
         raise
 
-    # Recover every result that reached disk, including completed work from
-    # workers terminated after another GPU failed.
+    # Recover every result that reached disk, including phases skipped during
+    # resume and work from workers terminated after another GPU failed.
     failed_keys = {
         (record["task_name"], record["phase"]) for record in failed_records
     }
-    for state in worker_states:
-        for assignment in state.assignments:
-            task_name = assignment["task_name"]
-            phase = assignment["phase"]
+    for task_name in tasks:
+        for phase in ("clean", "random"):
             result_file = (
                 run_output_dir
                 / task_name
@@ -641,7 +723,6 @@ def main(cfg: DictConfig) -> None:
                     task_rates[task_name][phase] = success_rate
                     log(
                         f"done task={task_name} phase={phase} "
-                        f"gpu={state.gpu_id} worker={state.gpu_worker_id} "
                         f"success_rate={success_rate:.4f}"
                     )
                 except Exception as exc:
@@ -650,7 +731,7 @@ def main(cfg: DictConfig) -> None:
                             {
                                 "task_name": task_name,
                                 "phase": phase,
-                                "gpu_id": state.gpu_id,
+                                "gpu_id": -1,
                                 "return_code": 0,
                                 "reason": f"result_parse_failed:{exc!r}",
                             }
@@ -667,7 +748,7 @@ def main(cfg: DictConfig) -> None:
                     {
                         "task_name": task_name,
                         "phase": phase,
-                        "gpu_id": state.gpu_id,
+                        "gpu_id": -1,
                         "return_code": -1,
                         "reason": (
                             "aborted_not_completed"
@@ -680,7 +761,7 @@ def main(cfg: DictConfig) -> None:
                     has_failure = True
                     failure_message = (
                         f"result missing: task={task_name}, phase={phase}, "
-                        f"gpu={state.gpu_id}, file={result_file}"
+                        f"file={result_file}"
                     )
 
     write_outputs()

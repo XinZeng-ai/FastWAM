@@ -21,6 +21,9 @@ EVALUATION:
   instruction_type: unseen
   eval_num_episodes: 100
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+  # Phase-level resume: reuse valid _result_clean/random.txt files and rerun
+  # only phases that did not finish. Disabled by default for compatibility.
+  resume_existing: false
 
   # Action inference
   action_horizon: null
