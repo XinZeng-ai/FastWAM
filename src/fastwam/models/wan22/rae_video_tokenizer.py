@@ -31,18 +31,34 @@ _SIGLIP_MEAN = (0.5, 0.5, 0.5)
 _SIGLIP_STD = (0.5, 0.5, 0.5)
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _resolve_candidates(path: str | Path) -> list[Path]:
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        return [raw.resolve()]
+    return [raw.resolve(), (_PROJECT_ROOT / raw).resolve()]
+
+
 def _require_file(path: str | Path, label: str) -> Path:
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"{label} not found: {resolved}")
-    return resolved
+    candidates = _resolve_candidates(path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"{label} not found: " + " | ".join(str(c) for c in candidates)
+    )
 
 
 def _require_dir(path: str | Path, label: str) -> Path:
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_dir():
-        raise FileNotFoundError(f"{label} directory not found: {resolved}")
-    return resolved
+    candidates = _resolve_candidates(path)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"{label} directory not found: " + " | ".join(str(c) for c in candidates)
+    )
 
 
 def _image_normalize(
