@@ -26,13 +26,14 @@ _TRAIN_RE = re.compile(
 )
 
 _VAL_RE = re.compile(
-    r"step=(\d+)\s+val_loss=([\d.eE+-]+)"
-    r"(?:.*?infer_psnr=([\d.eE+-]+))?"
-    r"(?:.*?infer_ssim=([\d.eE+-]+))?"
-    r"(?:.*?action_l2=([\d.eE+-]+))?"
-    r"(?:.*?action_l1=([\d.eE+-]+))?",
+    r"step=(\d+)\s+val_loss=([\d.eE+-]+)(.*?)(?=\d{2}/\d{2}\s+\[|\Z)",
     re.DOTALL,
 )
+
+
+def _optional_metric(text: str, name: str) -> float | None:
+    match = re.search(rf"{name}=([\d.eE+-]+)", text)
+    return float(match.group(1)) if match else None
 
 
 def parse_log(log_path):
@@ -52,13 +53,16 @@ def parse_log(log_path):
 
     val_raw = []
     for m in _VAL_RE.finditer(text):
+        metric_text = m.group(3)
         val_raw.append({
             "step": int(m.group(1)),
             "val_loss": float(m.group(2)),
-            "psnr": float(m.group(3)) if m.group(3) else None,
-            "ssim": float(m.group(4)) if m.group(4) else None,
-            "action_l2": float(m.group(5)) if m.group(5) else None,
-            "action_l1": float(m.group(6)) if m.group(6) else None,
+            "psnr": _optional_metric(metric_text, "infer_psnr"),
+            "ssim": _optional_metric(metric_text, "infer_ssim"),
+            "recon_psnr": _optional_metric(metric_text, "recon_psnr"),
+            "recon_ssim": _optional_metric(metric_text, "recon_ssim"),
+            "action_l2": _optional_metric(metric_text, "action_l2"),
+            "action_l1": _optional_metric(metric_text, "action_l1"),
         })
 
     train_dedup = {}
@@ -133,6 +137,10 @@ def main():
             by_step[s]["val/infer_psnr"] = rec["psnr"]
         if rec["ssim"] is not None:
             by_step[s]["val/infer_ssim"] = rec["ssim"]
+        if rec["recon_psnr"] is not None:
+            by_step[s]["val/recon_psnr"] = rec["recon_psnr"]
+        if rec["recon_ssim"] is not None:
+            by_step[s]["val/recon_ssim"] = rec["recon_ssim"]
         if rec["action_l2"] is not None:
             by_step[s]["val/action_l2"] = rec["action_l2"]
         if rec["action_l1"] is not None:

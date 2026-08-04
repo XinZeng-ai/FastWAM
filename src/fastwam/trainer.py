@@ -5,11 +5,14 @@ import os
 import re
 from math import ceil
 from pathlib import Path
+from datetime import timedelta
 import time
 
 import numpy as np
 import torch
+import torch.distributed.distributed_c10d as _c10d
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
@@ -57,10 +60,16 @@ class Wan22Trainer:
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
+        _dist_timeout_min = float(os.environ.get("FASTWAM_DIST_TIMEOUT_MIN", "90"))
+        _dist_timeout = timedelta(minutes=_dist_timeout_min)
+        _c10d.default_pg_timeout = _dist_timeout
+        if isinstance(_c10d.default_pg_nccl_timeout, timedelta):
+            _c10d.default_pg_nccl_timeout = _dist_timeout
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            kwargs_handlers=[InitProcessGroupKwargs(timeout=_dist_timeout)],
         )
         
         logger.info(
@@ -769,11 +778,16 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = (
+                                "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f "
+                                "recon_psnr=%.4f recon_ssim=%.4f"
+                            ) % (
                                 self.global_step,
                                 metrics["val_loss"],
                                 metrics["psnr_rd"],
                                 metrics["ssim_rd"],
+                                metrics["psnr_dg"],
+                                metrics["ssim_dg"],
                             )
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
