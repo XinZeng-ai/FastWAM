@@ -135,6 +135,7 @@ target/
 /third_party/RoboTwin/task_config
 /third_party/RoboTwin/policy/fastwam_policy
 /third_party/dinov3/
+/third_party/vjepa2/
 
 # IPython
 profile_default/
