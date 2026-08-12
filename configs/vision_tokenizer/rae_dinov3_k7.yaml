@@ -4,7 +4,8 @@ vision_tokenizer_config:
   encoder_type: dinov3_k7
   encoder_path: checkpoints/DINOv3-L-K7-d1024/encoder/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
   decoder_path: checkpoints/DINOv3-L-K7-d1024/decoder/decoder.pt
-  stats_path: ${oc.env:RAE_STATS_PATH,checkpoints/DINOv3-L-K7-d1024/robotwin_train_stats.pt}
+  stats_path: ${oc.env:RAE_STATS_PATH,checkpoints/DINOv3-L-K7-d1024/${data.rae_stats_filename}}
+  stats_dataset: ${data.rae_stats_dataset}
   dinov3_repo_path: ${oc.env:DINOV3_REPO_PATH,third_party/dinov3}
   eps: 1.0e-5
 

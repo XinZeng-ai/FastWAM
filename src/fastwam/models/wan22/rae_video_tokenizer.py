@@ -332,6 +332,7 @@ class FramewiseRAEVideoTokenizer(nn.Module):
         encoder_path: str,
         decoder_path: str,
         stats_path: str,
+        stats_dataset: str = "robotwin_train",
         dinov3_repo_path: str | None = None,
         eps: float = 1e-5,
     ):
@@ -393,9 +394,11 @@ class FramewiseRAEVideoTokenizer(nn.Module):
             "mae": "mae_b",
         }[encoder_type]
         metadata_errors = []
-        if stats.get("dataset") != "robotwin_train":
+        expected_stats_dataset = str(stats_dataset)
+        if stats.get("dataset") != expected_stats_dataset:
             metadata_errors.append(
-                f"dataset={stats.get('dataset')!r} (expected 'robotwin_train')"
+                f"dataset={stats.get('dataset')!r} "
+                f"(expected {expected_stats_dataset!r})"
             )
         if stats.get("representation") != expected_representation:
             metadata_errors.append(

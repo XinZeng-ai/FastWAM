@@ -13,7 +13,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from fastwam.models.wan22.rae_video_tokenizer import (
@@ -21,6 +21,50 @@ from fastwam.models.wan22.rae_video_tokenizer import (
     _MAEEncoder,
     _SigLIP2Encoder,
 )
+
+
+class _RoboTwinEpisodeVideoDataset(Dataset):
+    """Decode each selected episode once, then reuse the training video preprocessing."""
+
+    def __init__(self, robot_dataset):
+        self.robot_dataset = robot_dataset
+        self.sources = robot_dataset.lerobot_dataset.multi_dataset._datasets
+        self.episodes = []
+        for source_index, source in enumerate(self.sources):
+            source_episode_ids = source.episodes
+            if source_episode_ids is None:
+                source_episode_ids = list(range(source.num_episodes))
+            for episode_position, episode_id in enumerate(source_episode_ids):
+                self.episodes.append(
+                    (source_index, episode_position, int(episode_id))
+                )
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def __getitem__(self, index):
+        source_index, episode_position, episode_id = self.episodes[index]
+        source = self.sources[source_index]
+        start = int(source.episode_data_index["from"][episode_position])
+        stop = int(source.episode_data_index["to"][episode_position])
+        selected = source.hf_dataset[list(range(start, stop))]
+        timestamps = [
+            float(value.item() if isinstance(value, torch.Tensor) else value)
+            for value in selected["timestamp"]
+        ]
+        query_timestamps = {
+            key: timestamps for key in source.meta.video_keys
+        }
+        decoded = source._query_videos(query_timestamps, episode_id)
+        camera_keys = [
+            meta["lerobot_key"]
+            for meta in self.robot_dataset.lerobot_dataset.image_meta
+        ]
+        raw_video = torch.stack([decoded[key] for key in camera_keys], dim=0)
+        video, _ = self.robot_dataset.prepare_video(
+            raw_video, temporal_indices=slice(None)
+        )
+        return {"video": video, "episode_index": episode_id}
 
 
 def parse_args():
@@ -31,6 +75,12 @@ def parse_args():
         choices=("dinov3_k7", "siglip2_b", "mae_b"),
     )
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--data-config",
+        default="robotwin",
+        choices=("robotwin", "robotwin_clean2500"),
+        help="RoboTwin data config whose training split defines the stats population.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
@@ -67,6 +117,24 @@ def parse_args():
             "to compute an interleaved diagnostic sample."
         ),
     )
+    parser.add_argument(
+        "--unique-frames",
+        action="store_true",
+        help=(
+            "Cover every source frame in the selected training episodes exactly "
+            "once. Non-overlapping nine-frame windows are selected per episode "
+            "and episode-tail padding is excluded from the moments."
+        ),
+    )
+    parser.add_argument(
+        "--episode-streaming",
+        action="store_true",
+        help=(
+            "Decode every selected episode once and encode it in frame chunks. "
+            "Requires --unique-frames and avoids repeated random seeks. In this "
+            "mode --batch-size is the encoder frame chunk size."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--data-parallel",
@@ -80,6 +148,10 @@ def main():
     args = parse_args()
     if args.sample_frames is not None and args.sample_frames <= 0:
         raise ValueError(f"`--sample-frames` must be positive, got {args.sample_frames}")
+    if args.unique_frames and args.sample_frames is not None:
+        raise ValueError("`--unique-frames` and `--sample-frames` are mutually exclusive")
+    if args.episode_streaming and not args.unique_frames:
+        raise ValueError("`--episode-streaming` requires `--unique-frames`")
     if not 0.0 <= args.sample_phase < 1.0:
         raise ValueError(f"`--sample-phase` must be in [0, 1), got {args.sample_phase}")
     root = Path(__file__).resolve().parents[1]
@@ -94,7 +166,10 @@ def main():
 
     task = f"robotwin_uncond_3cam_384_rae_{args.representation}_1e-4"
     with initialize_config_dir(config_dir=str(root / "configs"), version_base=None):
-        cfg = compose(config_name="train", overrides=[f"task={task}"])
+        cfg = compose(
+            config_name="train",
+            overrides=[f"task={task}", f"data={args.data_config}"],
+        )
     # Stats are position-wise over independent frames; they have no temporal
     # axis. Decode nine contiguous frames instead of the training action window
     # of 33 frames followed by stride-4 selection. The camera mosaic, spatial
@@ -141,11 +216,41 @@ def main():
         )
         print(f"Using DataParallel across {visible_cuda_devices} CUDA devices")
     dataset = instantiate(cfg.data.train)
+    selected_episode_count = len(dataset.lerobot_dataset.episode_data_index["from"])
     full_dataset_length = len(dataset)
     frames_per_sample = 9
     selected_windows = full_dataset_length
     sampling_method = "complete_train_windows"
-    if args.sample_frames is not None:
+    expected_unique_frames = None
+    if args.unique_frames:
+        episode_from = dataset.lerobot_dataset.episode_data_index["from"].tolist()
+        episode_to = dataset.lerobot_dataset.episode_data_index["to"].tolist()
+        indices = []
+        expected_unique_frames = 0
+        for start, stop in zip(episode_from, episode_to, strict=True):
+            start = int(start)
+            stop = int(stop)
+            if stop <= start:
+                raise RuntimeError(
+                    f"Invalid RoboTwin episode bounds: from={start}, to={stop}"
+                )
+            indices.extend(range(start, stop, frames_per_sample))
+            expected_unique_frames += stop - start
+        selected_windows = len(indices)
+        if args.episode_streaming:
+            dataset = _RoboTwinEpisodeVideoDataset(dataset)
+            selected_windows = len(dataset)
+            sampling_method = "complete_train_unique_frames_episode_streaming"
+        else:
+            dataset = Subset(dataset, indices)
+            sampling_method = "complete_train_unique_frames"
+        print(
+            "Complete RoboTwin unique-frame coverage: "
+            f"frames={expected_unique_frames}, "
+            f"decode_units={selected_windows}, "
+            f"training_episodes={selected_episode_count}"
+        )
+    elif args.sample_frames is not None:
         selected_windows = min(
             math.ceil(args.sample_frames / frames_per_sample),
             full_dataset_length,
@@ -183,13 +288,17 @@ def main():
             f"requested_frames={args.sample_frames}, "
             f"selected_windows={selected_windows}/{full_dataset_length}"
         )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.episode_streaming:
+        loader_kwargs["batch_size"] = None
+    else:
+        loader_kwargs["batch_size"] = args.batch_size
+    loader = DataLoader(**loader_kwargs)
 
     total = torch.zeros(channels, 24, 20, dtype=torch.float64)
     total_sq = torch.zeros_like(total)
@@ -200,6 +309,25 @@ def main():
     with torch.no_grad():
         for sample in tqdm(batches, desc="RoboTwin RAE stats"):
             video = sample["video"]
+            if args.episode_streaming:
+                if tuple(video.shape[:1] + video.shape[2:]) != (3, 384, 320):
+                    raise ValueError(
+                        "Expected streamed RoboTwin episode [3,T,384,320], got "
+                        f"{tuple(video.shape)}"
+                    )
+                images = video.permute(1, 0, 2, 3)
+                for image_chunk in images.split(args.batch_size, dim=0):
+                    tokens = encoder(
+                        image_chunk.to(device=device, non_blocking=True)
+                    )
+                    latents = tokens.transpose(1, 2).reshape(
+                        image_chunk.shape[0], channels, 24, 20
+                    )
+                    latents = latents.double()
+                    total += latents.sum(dim=0).cpu()
+                    total_sq += latents.square().sum(dim=0).cpu()
+                    count += latents.shape[0]
+                continue
             if tuple(video.shape[1:]) != (3, 9, 384, 320):
                 raise ValueError(
                     "Expected RoboTwin mosaic [B,3,9,384,320], got "
@@ -213,23 +341,44 @@ def main():
             latents = tokens.transpose(1, 2).reshape(
                 batch * frames, channels, 24, 20
             )
+            if args.unique_frames:
+                image_is_pad = sample.get("image_is_pad")
+                if image_is_pad is None:
+                    raise KeyError(
+                        "RoboTwin sample has no `image_is_pad`; cannot exclude "
+                        "episode-tail padding in --unique-frames mode"
+                    )
+                valid_frames = ~image_is_pad.reshape(-1).bool()
+                if valid_frames.numel() != latents.shape[0]:
+                    raise ValueError(
+                        "Flattened image padding mask does not match RAE frames: "
+                        f"mask={valid_frames.numel()}, latents={latents.shape[0]}"
+                    )
+                latents = latents[valid_frames.to(device=latents.device)]
             if args.sample_frames is not None:
                 remaining = args.sample_frames - count
                 if remaining <= 0:
                     break
                 latents = latents[:remaining]
-            latents = latents.double().cpu()
-            total += latents.sum(dim=0)
-            total_sq += latents.square().sum(dim=0)
+            latents = latents.double()
+            total += latents.sum(dim=0).cpu()
+            total_sq += latents.square().sum(dim=0).cpu()
             count += latents.shape[0]
 
     if count < 2:
         raise RuntimeError(f"Need at least two frames for statistics, got {count}")
+    if (
+        args.unique_frames
+        and args.max_batches is None
+        and count != expected_unique_frames
+    ):
+        raise RuntimeError(
+            "Unique-frame coverage count mismatch: "
+            f"expected={expected_unique_frames}, accumulated={count}"
+        )
     mean = total / count
     var = (total_sq / count - mean.square()).clamp_min(0.0)
-    complete_train_split = (
-        args.sample_frames is None and args.max_batches is None
-    )
+    complete_train_split = args.sample_frames is None and args.max_batches is None
     formal_eligible = args.max_batches is None and (
         complete_train_split
         or (
@@ -245,13 +394,25 @@ def main():
             "mean": mean.float(),
             "var": var.float(),
             "count": count,
-            "dataset": "robotwin_train",
+            "dataset": (
+                "robotwin_clean2500_train"
+                if args.data_config == "robotwin_clean2500"
+                else "robotwin_train"
+            ),
+            "data_config": args.data_config,
+            "selected_train_episodes": selected_episode_count,
+            "episode_selection": OmegaConf.to_container(
+                cfg.data.train.get("episode_selection", {}), resolve=True
+            ),
             "representation": args.representation,
             "grid_size": (24, 20),
             "input_size": (384, 320),
             "complete_train_split": complete_train_split,
             "formal_eligible": formal_eligible,
             "sampling_method": sampling_method,
+            "unique_frames": args.unique_frames,
+            "episode_streaming": args.episode_streaming,
+            "expected_unique_frames": expected_unique_frames,
             "full_dataset_windows": full_dataset_length,
             "selected_windows": selected_windows,
             "requested_frames": args.sample_frames,

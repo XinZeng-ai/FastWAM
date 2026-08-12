@@ -41,3 +41,8 @@ def register_work_dir(path: str | os.PathLike | None) -> None:
 
 def get_work_dir() -> str | None:
     return _WORK_DIR if _WORK_DIR is not None else _DEFAULT_WORK_DIR
+
+
+def has_registered_work_dir() -> bool:
+    """Return whether the current entry point registered an explicit work directory."""
+    return _WORK_DIR is not None

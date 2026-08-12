@@ -1,0 +1,24 @@
+# @package data
+defaults:
+  - robotwin
+  - _self_
+
+rae_stats_dataset: robotwin_clean2500_train
+rae_stats_filename: robotwin_clean2500_train_stats.pt
+
+# RoboTwin2.0 stores 50 task groups with 550 episodes per task. Within each
+# group the first 50 episodes are demo_clean and the remaining 500 are
+# demo_randomized: 50 tasks x 50 clean episodes = 2500 clean episodes.
+train:
+  episode_selection: &clean2500
+    mode: grouped_prefix
+    group_size: 550
+    prefix_size: 50
+    expected_total_episodes: 27500
+    expected_selected_episodes: 2500
+  # Computed on the 2475-episode train portion after the unchanged 1% split.
+  pretrained_norm_stats: ./data/robotwin2.0/dataset_stats_clean2500_train.json
+
+val:
+  episode_selection: *clean2500
+  pretrained_norm_stats: ./data/robotwin2.0/dataset_stats_clean2500_train.json

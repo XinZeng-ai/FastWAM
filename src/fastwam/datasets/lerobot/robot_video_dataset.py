@@ -43,6 +43,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        episode_selection=None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -53,6 +54,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
             verify_episode_files=verify_episode_files,
+            episode_selection=(
+                OmegaConf.to_container(episode_selection, resolve=True)
+                if isinstance(episode_selection, DictConfig)
+                else episode_selection
+            ),
         )
     
         self.num_frames = num_frames
@@ -104,7 +110,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else:
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
-                if PartialState().is_main_process:
+                if (
+                    PartialState().is_main_process
+                    and misc.has_registered_work_dir()
+                ):
                     work_dir = misc.get_work_dir()
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
 
@@ -140,17 +149,61 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             sample_idx = np.random.randint(len(self.lerobot_dataset))
         
         image_is_pad = sample["image_is_pad"]
+        video, image_is_pad = self.prepare_video(
+            sample["pixel_values"], image_is_pad=image_is_pad
+        )
 
-        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+        # Proxy (from lerobot):
+        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
+        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
+        action = sample["action"] # [T-1, action_dim]
+        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        if video.shape[1] <= 1:
+            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
+        if action.shape[0] % (video.shape[1] - 1) != 0:
+            raise ValueError(
+                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+            )
+
+        task = sample["instruction"]
+
+        # FIXME
+        if self.override_instruction is not None:
+            task = self.override_instruction
+        instruction = DEFAULT_PROMPT.format(task=task)
+
+        context, context_mask = self._get_cached_text_context(instruction)
+        # NOTE: to keep consistent with wan2.2's behavior
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+
+        data = {
+            "video": video,
+            "action": action,
+            "proprio": proprio,
+            "prompt": instruction,
+            "context": context,
+            "context_mask": context_mask,
+            "image_is_pad": image_is_pad,
+            "action_is_pad": sample["action_is_pad"],
+            "proprio_is_pad": sample["proprio_is_pad"],
+        }
+        return data
+
+    def prepare_video(self, video, image_is_pad=None, temporal_indices=None):
+        """Apply the training camera mosaic and image preprocessing to a video."""
+        if temporal_indices is None:
+            temporal_indices = self.video_sample_indices
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            video = video[:, temporal_indices, :, :, :] # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            video = video[temporal_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        if image_is_pad is not None:
+            image_is_pad = image_is_pad[temporal_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
@@ -197,43 +250,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = self.normalize_transform(video)  # [T_video, C, H, W]
 
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
-
-        # Proxy (from lerobot): 
-        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
-        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
-            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
-            raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
-            )
-
-        task = sample["instruction"]
-        
-        # FIXME
-        if self.override_instruction is not None:
-            task = self.override_instruction
-        instruction = DEFAULT_PROMPT.format(task=task)
-
-        context, context_mask = self._get_cached_text_context(instruction)
-        # NOTE: to keep consistent with wan2.2's behavior
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
-        
-        data = {
-            "video": video,
-            "action": action,
-            "proprio": proprio,
-            "prompt": instruction,
-            "context": context,
-            "context_mask": context_mask,
-            "image_is_pad": image_is_pad,
-            "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
-        }
-        return data
+        return video, image_is_pad
 
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:

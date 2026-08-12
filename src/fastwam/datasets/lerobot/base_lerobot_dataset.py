@@ -34,6 +34,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # sampling
         global_sample_stride: int = 1,
         verify_episode_files: bool = True,
+        episode_selection: Optional[Dict[str, Any]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -87,20 +88,38 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
+        episode_selection = dict(episode_selection or {})
+        selection_mode = str(episode_selection.get("mode", "all"))
         if val_set_proportion < 1e-6:
             for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
+                selected_indices = self._select_episode_indices(
+                    meta.total_episodes, selection_mode, episode_selection
+                )
+                episodes.update({meta.repo_id: selected_indices})
         else:
             for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
+                selected_indices = self._select_episode_indices(
+                    meta.total_episodes, selection_mode, episode_selection
+                )
+                split_idx = int(len(selected_indices) * (1 - val_set_proportion))
                 # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
+                episode_indices = list(selected_indices)
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
                     episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episodes.update(
+                        {
+                            meta.repo_id: [
+                                episode_indices[i]
+                                for i in range(split_idx, len(episode_indices))
+                            ]
+                        }
+                    )
+
+        self.episode_selection = episode_selection
+        self.selected_episodes = episodes
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,
@@ -124,6 +143,51 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "from": torch.cat([dataset["from"] for dataset in episode_data_index]),
             "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
         }
+
+    @staticmethod
+    def _select_episode_indices(
+        total_episodes: int,
+        mode: str,
+        selection: Dict[str, Any],
+    ) -> List[int]:
+        if mode == "all":
+            return list(range(total_episodes))
+        if mode != "grouped_prefix":
+            raise ValueError(
+                f"Unsupported episode_selection.mode={mode!r}; "
+                "expected 'all' or 'grouped_prefix'."
+            )
+
+        group_size = int(selection.get("group_size", 0))
+        prefix_size = int(selection.get("prefix_size", 0))
+        expected_total = selection.get("expected_total_episodes")
+        expected_selected = selection.get("expected_selected_episodes")
+        if group_size <= 0 or prefix_size <= 0 or prefix_size > group_size:
+            raise ValueError(
+                "Invalid grouped-prefix episode selection: "
+                f"group_size={group_size}, prefix_size={prefix_size}."
+            )
+        if expected_total is not None and total_episodes != int(expected_total):
+            raise ValueError(
+                "Dataset episode count does not match the clean-subset contract: "
+                f"expected {int(expected_total)}, got {total_episodes}."
+            )
+        if total_episodes % group_size != 0:
+            raise ValueError(
+                f"total_episodes={total_episodes} is not divisible by group_size={group_size}."
+            )
+
+        indices = [
+            group_start + offset
+            for group_start in range(0, total_episodes, group_size)
+            for offset in range(prefix_size)
+        ]
+        if expected_selected is not None and len(indices) != int(expected_selected):
+            raise ValueError(
+                "Selected episode count does not match the clean-subset contract: "
+                f"expected {int(expected_selected)}, got {len(indices)}."
+            )
+        return indices
 
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]

@@ -62,6 +62,9 @@ train:
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin
   context_len: 128
 
+rae_stats_dataset: robotwin_train
+rae_stats_filename: robotwin_train_stats.pt
+
 val:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:

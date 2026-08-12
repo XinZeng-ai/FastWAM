@@ -4,7 +4,8 @@ vision_tokenizer_config:
   encoder_type: siglip2
   encoder_path: checkpoints/SigLIP2-B-d768/encoder
   decoder_path: checkpoints/SigLIP2-B-d768/decoder/model.pt
-  stats_path: ${oc.env:RAE_STATS_PATH,checkpoints/SigLIP2-B-d768/robotwin_train_stats.pt}
+  stats_path: ${oc.env:RAE_STATS_PATH,checkpoints/SigLIP2-B-d768/${data.rae_stats_filename}}
+  stats_dataset: ${data.rae_stats_dataset}
   dinov3_repo_path: null
   eps: 1.0e-5
 
