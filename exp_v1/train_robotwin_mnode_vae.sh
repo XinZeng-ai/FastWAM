@@ -73,7 +73,6 @@ export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/pycache_fastwam_$(id -u)
 mkdir -p "${PYTHONPYCACHEPREFIX}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export WANDB_API_KEY="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"
 export TZ="${TZ:-Asia/Shanghai}"
 export HF_HOME="${HF_HOME:-/ytech_milm_intern/zengxin08/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
