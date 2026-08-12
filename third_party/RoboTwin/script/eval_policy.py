@@ -353,7 +353,12 @@ def eval_policy(task_name,
         current_video_path = None
         if TASK_ENV.eval_video_path is not None:
             episode_idx = TASK_ENV.test_num
-            current_video_path = Path(TASK_ENV.eval_video_path) / f"episode{episode_idx}.mp4"
+            is_randomized = "randomized" in str(args["task_config"]).lower()
+            eval_phase = "randomized" if is_randomized else "clean"
+            current_video_path = (
+                Path(TASK_ENV.eval_video_path)
+                / f"episode{episode_idx}_{eval_phase}_inprogress.mp4"
+            )
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -401,8 +406,6 @@ def eval_policy(task_name,
             TASK_ENV._del_eval_video_ffmpeg()
             if current_video_path is None or not current_video_path.exists():
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
-            is_randomized = "randomized" in str(args["task_config"]).lower()
-            eval_phase = "randomized" if is_randomized else "clean"
             eval_result = "success" if succ else "fail"
             renamed_video_path = (
                 Path(TASK_ENV.eval_video_path)

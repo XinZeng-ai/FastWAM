@@ -44,6 +44,15 @@ def _resolve_path(path_str: str, *, base: Path) -> Path:
     return path.resolve()
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
 def _resolve_optional_path(path_value: Any, *, base: Path) -> Path | None:
     if path_value is None:
         return None
@@ -202,8 +211,45 @@ def _build_assignments(
     task_step_limits: dict[str, int],
     task_episode_counts: dict[str, int],
     num_workers: int,
+    split_phases_across_workers: bool = False,
 ) -> tuple[list[list[dict[str, Any]]], list[int]]:
-    """Greedily balance whole task pairs while keeping clean before random."""
+    """Greedily balance evaluation work across persistent workers."""
+    phase_to_task_config = {
+        "clean": "demo_clean",
+        "random": "demo_randomized",
+    }
+
+    if split_phases_across_workers:
+        buckets: list[list[dict[str, Any]]] = [[] for _ in range(num_workers)]
+        loads = [0 for _ in range(num_workers)]
+        phase_assignments = [
+            {
+                "task_name": task_name,
+                "phase": phase,
+                "task_config": phase_to_task_config[phase],
+                "eval_num_episodes": task_episode_counts[task_name],
+            }
+            for task_name in tasks
+            for phase in ("clean", "random")
+        ]
+        phase_assignments.sort(
+            key=lambda item: (
+                task_step_limits.get(str(item["task_name"]), 1)
+                * int(item["eval_num_episodes"])
+            ),
+            reverse=True,
+        )
+        for assignment in phase_assignments:
+            worker_id = min(range(num_workers), key=lambda idx: loads[idx])
+            task_name = str(assignment["task_name"])
+            load = (
+                task_step_limits.get(task_name, 1)
+                * int(assignment["eval_num_episodes"])
+            )
+            buckets[worker_id].append(assignment)
+            loads[worker_id] += load
+        return buckets, loads
+
     task_buckets: list[list[str]] = [[] for _ in range(num_workers)]
     estimated_loads = [0 for _ in range(num_workers)]
 
@@ -228,10 +274,6 @@ def _build_assignments(
             * task_episode_counts[task_name]
         )
 
-    phase_to_task_config = {
-        "clean": "demo_clean",
-        "random": "demo_randomized",
-    }
     assignments: list[list[dict[str, Any]]] = []
     for task_bucket in task_buckets:
         worker_assignments: list[dict[str, Any]] = []
@@ -253,8 +295,9 @@ def _rebalance_pending_assignments(
     assignments: list[dict[str, Any]],
     task_step_limits: dict[str, int],
     num_workers: int,
+    split_phases_across_workers: bool = False,
 ) -> tuple[list[list[dict[str, Any]]], list[int]]:
-    """Balance pending phases while keeping phases of one task serialized."""
+    """Balance pending phases, optionally allowing task phases to run concurrently."""
     assignments_by_task: dict[str, list[dict[str, Any]]] = {}
     for assignment in assignments:
         task_name = str(assignment["task_name"])
@@ -269,6 +312,18 @@ def _rebalance_pending_assignments(
 
     buckets: list[list[dict[str, Any]]] = [[] for _ in range(num_workers)]
     loads = [0 for _ in range(num_workers)]
+    if split_phases_across_workers:
+        ordered_assignments = sorted(
+            assignments,
+            key=assignment_load,
+            reverse=True,
+        )
+        for assignment in ordered_assignments:
+            worker_id = min(range(num_workers), key=lambda idx: loads[idx])
+            buckets[worker_id].append(assignment)
+            loads[worker_id] += assignment_load(assignment)
+        return buckets, loads
+
     ordered_task_assignments = sorted(
         assignments_by_task.values(),
         key=lambda group: sum(assignment_load(item) for item in group),
@@ -342,7 +397,24 @@ def main(cfg: DictConfig) -> None:
     workers_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if workers_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
-    num_workers = num_gpus * workers_per_gpu
+    num_nodes = int(cfg.MULTIRUN.get("num_nodes", 1))
+    node_rank = int(cfg.MULTIRUN.get("node_rank", 0))
+    coordination_timeout_sec = int(
+        cfg.MULTIRUN.get("coordination_timeout_sec", 3600)
+    )
+    if num_nodes <= 0:
+        raise ValueError("`MULTIRUN.num_nodes` must be > 0.")
+    if node_rank < 0 or node_rank >= num_nodes:
+        raise ValueError(
+            f"`MULTIRUN.node_rank` must be in [0, {num_nodes}), got {node_rank}."
+        )
+    if coordination_timeout_sec <= 0:
+        raise ValueError("`MULTIRUN.coordination_timeout_sec` must be > 0.")
+    local_num_workers = num_gpus * workers_per_gpu
+    num_workers = num_nodes * local_num_workers
+    split_phases_across_workers = bool(
+        cfg.MULTIRUN.get("split_phases_across_workers", num_nodes > 1)
+    )
 
     output_dir = _resolve_path(
         str(cfg.EVALUATION.output_dir),
@@ -356,6 +428,14 @@ def main(cfg: DictConfig) -> None:
     run_output_dir = (
         PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     )
+    session_id = str(cfg.MULTIRUN.get("session_id", run_ts)).strip()
+    if session_id == "":
+        raise ValueError("`MULTIRUN.session_id` must not be empty.")
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in session_id):
+        raise ValueError(
+            "`MULTIRUN.session_id` may contain only letters, digits, dot, "
+            f"underscore, and hyphen; got {session_id!r}."
+        )
     resume_existing = bool(cfg.EVALUATION.resume_existing)
     if resume_existing and not run_output_dir.is_dir():
         raise FileNotFoundError(
@@ -365,10 +445,16 @@ def main(cfg: DictConfig) -> None:
         )
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    manager_log = run_output_dir / "manager.log"
+    manager_log = run_output_dir / (
+        "manager.log" if node_rank == 0 else f"manager.node{node_rank}.log"
+    )
     failed_tasks_file = run_output_dir / "failed_tasks.txt"
     summary_csv = run_output_dir / "summary.csv"
     summary_json = run_output_dir / "summary.json"
+    node_status_file = (
+        run_output_dir
+        / f"manager.{session_id}.node{node_rank}.status.json"
+    )
 
     task_step_limits = _load_task_step_limits()
     task_episode_counts = _load_task_episode_counts()
@@ -392,6 +478,7 @@ def main(cfg: DictConfig) -> None:
         task_step_limits,
         task_episode_counts,
         num_workers,
+        split_phases_across_workers=split_phases_across_workers,
     )
     resumed_phases = 0
     resumed_episodes = 0
@@ -420,6 +507,7 @@ def main(cfg: DictConfig) -> None:
                 pending_assignments,
                 task_step_limits,
                 num_workers,
+                split_phases_across_workers=split_phases_across_workers,
             )
         )
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -435,6 +523,7 @@ def main(cfg: DictConfig) -> None:
         "mixed_precision": str(cfg.mixed_precision),
         "device": str(cfg.EVALUATION.device),
         "dataset_stats_path": str(dataset_stats_path),
+        "rae_stats_dataset": str(cfg.data.rae_stats_dataset),
         "action_horizon": (
             None
             if cfg.EVALUATION.action_horizon is None
@@ -557,9 +646,12 @@ def main(cfg: DictConfig) -> None:
                 state.process.wait()
 
     log(
-        f"manager start tasks={len(tasks)} gpu_ids={list(range(num_gpus))} "
+        f"manager start node_rank={node_rank}/{num_nodes} tasks={len(tasks)} "
+        f"local_gpu_ids={list(range(num_gpus))} "
         f"workers_per_gpu={workers_per_gpu} "
-        f"persistent_workers={num_workers} "
+        f"local_persistent_workers={local_num_workers} "
+        f"global_persistent_workers={num_workers} "
+        f"assignment_granularity={'phase' if split_phases_across_workers else 'task_pair'} "
         f"episodes_per_phase={sum(task_episode_counts[t] for t in tasks)} "
         f"output_dir={run_output_dir}"
     )
@@ -571,27 +663,53 @@ def main(cfg: DictConfig) -> None:
             f"pending_phases={total_phases - resumed_phases}"
         )
 
+    _write_json_atomic(
+        node_status_file,
+        {
+            "session_id": session_id,
+            "node_rank": node_rank,
+            "num_nodes": num_nodes,
+            "state": "running",
+            "error": None,
+        },
+    )
+
     inherited_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    for worker_id, assignments in enumerate(assignments_by_worker):
-        gpu_id = worker_id // workers_per_gpu
-        gpu_worker_id = worker_id % workers_per_gpu
+    # Interleave global worker buckets across nodes. _build_assignments places
+    # the longest tasks into the earliest empty buckets, so contiguous slices
+    # would concentrate slow tasks on node 0 when workers outnumber tasks.
+    local_worker_ids = list(range(node_rank, num_workers, num_nodes))
+    if len(local_worker_ids) != local_num_workers:
+        raise RuntimeError(
+            "Internal worker partition mismatch: "
+            f"node={node_rank}, expected={local_num_workers}, "
+            f"actual={len(local_worker_ids)}"
+        )
+    for local_worker_id, worker_id in enumerate(local_worker_ids):
+        assignments = assignments_by_worker[worker_id]
+        local_gpu_id = local_worker_id // workers_per_gpu
+        global_gpu_id = node_rank * num_gpus + local_gpu_id
+        gpu_worker_id = local_worker_id % workers_per_gpu
         if len(assignments) == 0:
             log(
-                f"skip gpu={gpu_id} worker={gpu_worker_id}: "
+                f"skip node={node_rank} local_gpu={local_gpu_id} "
+                f"worker={gpu_worker_id}: "
                 "no assigned tasks"
             )
             continue
 
         selected_device = _select_cuda_device(
-            gpu_id,
+            local_gpu_id,
             inherited_visible_devices,
         )
-        worker_label = f"gpu{gpu_id}_worker{gpu_worker_id}"
+        worker_label = f"gpu{global_gpu_id}_worker{gpu_worker_id}"
         status_file = run_output_dir / f"worker_{worker_label}_status.json"
         job_file = run_output_dir / f"worker_{worker_label}_job.json"
         job_payload = {
             "worker_id": worker_id,
-            "gpu_id": gpu_id,
+            "node_rank": node_rank,
+            "gpu_id": global_gpu_id,
+            "local_gpu_id": local_gpu_id,
             "gpu_worker_id": gpu_worker_id,
             "robotwin_root": str(robotwin_root),
             "run_output_dir": str(run_output_dir),
@@ -615,7 +733,8 @@ def main(cfg: DictConfig) -> None:
             str(job_file),
         ]
         log(
-            f"launch persistent worker gpu={gpu_id} "
+            f"launch persistent worker node={node_rank} "
+            f"global_gpu={global_gpu_id} local_gpu={local_gpu_id} "
             f"worker={gpu_worker_id} "
             f"physical_device={selected_device} "
             f"tasks={len({a['task_name'] for a in assignments})} "
@@ -631,7 +750,7 @@ def main(cfg: DictConfig) -> None:
         worker_states.append(
             WorkerState(
                 worker_id=worker_id,
-                gpu_id=gpu_id,
+                gpu_id=global_gpu_id,
                 gpu_worker_id=gpu_worker_id,
                 assignments=assignments,
                 status_file=status_file,
@@ -703,7 +822,104 @@ def main(cfg: DictConfig) -> None:
     except KeyboardInterrupt:
         log("manager interrupted; terminating persistent workers")
         terminate_workers()
+        _write_json_atomic(
+            node_status_file,
+            {
+                "session_id": session_id,
+                "node_rank": node_rank,
+                "num_nodes": num_nodes,
+                "state": "failed",
+                "error": "manager_interrupted",
+                "failed_records": failed_records,
+            },
+        )
         raise
+
+    _write_json_atomic(
+        node_status_file,
+        {
+            "session_id": session_id,
+            "node_rank": node_rank,
+            "num_nodes": num_nodes,
+            "state": "failed" if has_failure else "completed",
+            "error": failure_message if has_failure else None,
+            "failed_records": failed_records,
+        },
+    )
+
+    if num_nodes > 1 and node_rank != 0:
+        if has_failure:
+            raise RuntimeError(failure_message)
+        log(
+            f"node {node_rank} finished successfully; "
+            "rank 0 will aggregate the shared results"
+        )
+        return
+
+    if num_nodes > 1:
+        log(
+            f"rank 0 waiting for {num_nodes} node completion markers "
+            f"for session={session_id}"
+        )
+        deadline = time.time() + coordination_timeout_sec
+        node_payloads: dict[int, dict[str, Any]] = {}
+        while len(node_payloads) < num_nodes:
+            for expected_rank in range(num_nodes):
+                if expected_rank in node_payloads:
+                    continue
+                path = (
+                    run_output_dir
+                    / f"manager.{session_id}.node{expected_rank}.status.json"
+                )
+                if not path.exists():
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if payload.get("session_id") != session_id:
+                    continue
+                if payload.get("state") not in {"completed", "failed"}:
+                    continue
+                node_payloads[expected_rank] = payload
+                log(
+                    f"node completion marker received: node={expected_rank} "
+                    f"state={payload.get('state')}"
+                )
+            if len(node_payloads) == num_nodes:
+                break
+            if time.time() >= deadline:
+                missing_nodes = sorted(set(range(num_nodes)) - set(node_payloads))
+                has_failure = True
+                failure_message = (
+                    "timed out waiting for multi-node evaluation completion: "
+                    f"missing_nodes={missing_nodes}, session={session_id}"
+                )
+                failed_records.append(
+                    {
+                        "task_name": "<multi_node_coordination>",
+                        "phase": "unknown",
+                        "gpu_id": -1,
+                        "return_code": -1,
+                        "reason": failure_message,
+                    }
+                )
+                log(failure_message)
+                break
+            time.sleep(POLL_INTERVAL_SEC)
+
+        for expected_rank, payload in node_payloads.items():
+            if expected_rank == node_rank:
+                continue
+            for record in payload.get("failed_records", []):
+                failed_records.append(record)
+            if payload.get("state") == "failed":
+                has_failure = True
+                if failure_message == "":
+                    failure_message = str(
+                        payload.get("error")
+                        or f"evaluation node {expected_rank} failed"
+                    )
 
     # Recover every result that reached disk, including phases skipped during
     # resume and work from workers terminated after another GPU failed.

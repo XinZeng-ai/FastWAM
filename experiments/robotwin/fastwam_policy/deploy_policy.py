@@ -104,12 +104,21 @@ def _compose_sim_cfg(
     sim_cfg_path: Optional[str],
     sim_cfg_name: Optional[str],
     sim_task: Optional[str],
+    rae_stats_dataset: Optional[str] = None,
 ) -> DictConfig:
     config_name = _resolve_sim_cfg_name(sim_cfg_path=sim_cfg_path, sim_cfg_name=sim_cfg_name)
     configs_root = (PROJECT_ROOT / "configs").resolve()
     overrides = []
     if not _is_none_like(sim_task):
         overrides.append(f"task={str(sim_task)}")
+    if not _is_none_like(rae_stats_dataset):
+        stats_dataset = str(rae_stats_dataset)
+        overrides.extend(
+            [
+                f"data.rae_stats_dataset={stats_dataset}",
+                f"data.rae_stats_filename={stats_dataset}_stats.pt",
+            ]
+        )
 
     if GlobalHydra.instance().is_initialized():
         GlobalHydra.instance().clear()
@@ -734,6 +743,7 @@ def get_model(usr_args: Dict[str, Any]):
         sim_cfg_path=sim_cfg_path,
         sim_cfg_name=sim_cfg_name,
         sim_task=sim_task,
+        rae_stats_dataset=usr_args.get("rae_stats_dataset"),
     )
 
     checkpoint_path = usr_args.get("ckpt_setting")
