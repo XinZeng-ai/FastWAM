@@ -15,6 +15,7 @@ from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger, setup_logging
 from .utils.video_io import save_mp4
 from .utils import misc
+from .utils.pytorch_utils import set_global_seed
 
 logger = get_logger(__name__)
 
@@ -84,6 +85,9 @@ def create_fastwam(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    random_init_seed: int | None = None,
+    init_action_from_video: bool = False,
+    action_init_alpha_scaling: bool = True,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
@@ -159,6 +163,9 @@ def create_fastwam(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        random_init_seed=(None if random_init_seed is None else int(random_init_seed)),
+        init_action_from_video=bool(init_action_from_video),
+        action_init_alpha_scaling=bool(action_init_alpha_scaling),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -182,6 +189,9 @@ def create_fastwam_joint(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    random_init_seed: int | None = None,
+    init_action_from_video: bool = False,
+    action_init_alpha_scaling: bool = True,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
@@ -257,6 +267,9 @@ def create_fastwam_joint(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        random_init_seed=(None if random_init_seed is None else int(random_init_seed)),
+        init_action_from_video=bool(init_action_from_video),
+        action_init_alpha_scaling=bool(action_init_alpha_scaling),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -280,6 +293,9 @@ def create_fastwam_idm(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    random_init_seed: int | None = None,
+    init_action_from_video: bool = False,
+    action_init_alpha_scaling: bool = True,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
@@ -357,6 +373,9 @@ def create_fastwam_idm(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        random_init_seed=(None if random_init_seed is None else int(random_init_seed)),
+        init_action_from_video=bool(init_action_from_video),
+        action_init_alpha_scaling=bool(action_init_alpha_scaling),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -408,6 +427,10 @@ def run_training(cfg: DictConfig):
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
         OmegaConf.save(config_payload, f)
 
+    # Model construction used to happen before Wan22Trainer seeded the process.
+    # Seed here as well so every random-initialization experiment is
+    # reproducible; the trainer repeats this before sampler/worker creation.
+    set_global_seed(int(cfg.seed))
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)

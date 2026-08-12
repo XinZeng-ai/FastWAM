@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /data: robotwin_clean2500
+  - _self_
+
+# Version 2: no Wan Video DiT weights. Build the 1B Action DiT backbone from
+# the same random Video DiT with the shared interpolation + alpha scaling rule.
+model:
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+  random_init_seed: ${seed}
+  init_action_from_video: true
+  action_init_alpha_scaling: true
+  video_dit_config:
+    initialization_seed: ${seed}

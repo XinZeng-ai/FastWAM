@@ -335,6 +335,7 @@ class WanVideoDiT(torch.nn.Module):
         action_group_causal_mask_mode = "causal",
         video_attention_mask_mode: str = "bidirectional",
         use_gradient_checkpointing: bool = False,
+        initialization_seed: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -364,24 +365,40 @@ class WanVideoDiT(torch.nn.Module):
         assert require_clip_embedding == False
         assert require_vae_embedding == False and fuse_vae_embedding_in_latents == True, "Only support fusing vae embedding in latents"
 
+        def seed_module(offset: int) -> None:
+            if initialization_seed is not None:
+                torch.manual_seed(int(initialization_seed) + offset)
+
+        # A shape-dependent patch embedding otherwise advances the RNG by a
+        # different amount for VAE/DINO/SigLIP/MAE. Separate deterministic
+        # streams keep every shape-compatible Transformer body tensor exactly
+        # aligned across tokenizer comparisons.
+        seed_module(0)
         self.patch_embedding = nn.Conv3d(
             in_dim, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        seed_module(1)
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, hidden_dim),
             nn.GELU(approximate='tanh'),
             nn.Linear(hidden_dim, hidden_dim)
         )
+        seed_module(2)
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+        seed_module(3)
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps)
-            for _ in range(num_layers)
-        ])
+        blocks = []
+        for layer_index in range(num_layers):
+            seed_module(100 + layer_index)
+            blocks.append(
+                DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps)
+            )
+        self.blocks = nn.ModuleList(blocks)
+        seed_module(10_000)
         self.head = Head(hidden_dim, out_dim, patch_size, eps)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
         if has_ref_conv:
@@ -391,10 +408,12 @@ class WanVideoDiT(torch.nn.Module):
         self.control_adapter = None
 
         if self.action_conditioned:
+            seed_module(10_001)
             self.action_embedding = nn.Linear(action_dim, hidden_dim)
             self.action_group_causal_mask_mode = action_group_causal_mask_mode
         
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.initialization_seed = initialization_seed
         if self.use_gradient_checkpointing:
             logger.info("Using gradient checkpointing for DiT blocks. This will save memory but use more computation.")
             

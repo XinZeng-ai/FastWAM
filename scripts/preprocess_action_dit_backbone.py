@@ -3,10 +3,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from fastwam.models.wan22.action_dit import ActionDiT
+from fastwam.models.wan22.action_dit_init import build_action_backbone_from_video
 from fastwam.models.wan22.helpers.loader import load_wan22_ti2v_5b_components
 
 
@@ -48,52 +48,6 @@ def _resolve_from_video_cfg(value: Any, video_cfg: dict[str, Any]) -> Any:
         return value
     resolved = video_cfg[key]
     return value if _is_unresolved_interpolation(resolved) else resolved
-
-
-def _interpolate_last_dim(tensor: torch.Tensor, new_size: int) -> torch.Tensor:
-    if tensor.shape[-1] == new_size:
-        return tensor
-    flat = tensor.reshape(-1, 1, tensor.shape[-1]).to(torch.float32)
-    flat = F.interpolate(flat, size=new_size, mode="linear", align_corners=True)
-    return flat.reshape(*tensor.shape[:-1], new_size)
-
-
-def _resize_tensor_to_shape(src: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
-    if tuple(src.shape) == tuple(target_shape):
-        return src
-
-    out = src.to(torch.float32)
-    while out.ndim < len(target_shape):
-        out = out.unsqueeze(0)
-    while out.ndim > len(target_shape):
-        if out.shape[0] != 1:
-            raise ValueError(
-                f"Cannot reduce tensor rank for resize: src shape={tuple(src.shape)}, target={target_shape}"
-            )
-        out = out.squeeze(0)
-
-    for dim, new_size in enumerate(target_shape):
-        current_size = out.shape[dim]
-        if current_size == new_size:
-            continue
-        # Permute the target dimension to the end for interpolation
-        perm = [i for i in range(out.ndim) if i != dim] + [dim]
-        # Construct inverse permutation to restore original order
-        inv_perm = [0] * out.ndim
-        for i, p in enumerate(perm):
-            inv_perm[p] = i
-        # Permute, interpolate, and restore original order
-        out_perm = out.permute(*perm).contiguous()
-        prefix_shape = out_perm.shape[:-1]
-        out_perm = _interpolate_last_dim(out_perm, new_size)
-        out_perm = out_perm.reshape(*prefix_shape, new_size)
-        out = out_perm.permute(*inv_perm).contiguous()
-
-    if tuple(out.shape) != tuple(target_shape):
-        raise ValueError(
-            f"Resize produced wrong shape for tensor. src={tuple(src.shape)}, target={target_shape}, got={tuple(out.shape)}"
-        )
-    return out.to(dtype=src.dtype)
 
 
 def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -190,24 +144,16 @@ def main() -> None:
     video_state = video_expert.state_dict()
     backbone_keys = ActionDiT.backbone_key_set(action_state.keys())
 
-    backbone_state_dict: dict[str, torch.Tensor] = {}
-    copied = 0
-    interpolated = 0
-    for key in sorted(backbone_keys):
-        if key not in video_state:
-            raise ValueError(f"Key `{key}` not found in video expert state dict.")
-        src = video_state[key]
-        target = action_state[key]
-        if tuple(src.shape) == tuple(target.shape):
-            value = src
-            copied += 1
-        else:
-            value = _resize_tensor_to_shape(src, tuple(target.shape))
-            if apply_alpha_scaling and src.ndim >= 2 and src.shape[-1] != target.shape[-1]:
-                alpha = (float(src.shape[-1]) / float(target.shape[-1])) ** 0.5
-                value = value.to(torch.float32) * alpha
-            interpolated += 1
-        backbone_state_dict[key] = value.detach().to(dtype=target.dtype, device="cpu").contiguous()
+    backbone_state_dict, init_report = build_action_backbone_from_video(
+        video_state=video_state,
+        action_state=action_state,
+        backbone_keys=backbone_keys,
+        apply_alpha_scaling=apply_alpha_scaling,
+    )
+    backbone_state_dict = {
+        key: value.detach().to(device="cpu").contiguous()
+        for key, value in backbone_state_dict.items()
+    }
 
     payload = {
         "policy": {
@@ -232,7 +178,8 @@ def main() -> None:
     skipped = len(action_state) - len(backbone_keys)
     print(
         "[INFO] Saved ActionDiT backbone payload to "
-        f"{output_path} (copied={copied}, interpolated={interpolated}, skipped={skipped})."
+        f"{output_path} (copied={init_report['copied']}, "
+        f"interpolated={init_report['interpolated']}, skipped={skipped})."
     )
 
 

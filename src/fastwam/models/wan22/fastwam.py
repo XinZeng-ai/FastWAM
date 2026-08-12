@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -8,6 +9,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .action_dit_init import build_action_backbone_from_video
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -103,6 +105,9 @@ class FastWAM(torch.nn.Module):
         action_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
+        random_init_seed: int | None = None,
+        init_action_from_video: bool = False,
+        action_init_alpha_scaling: bool = True,
         mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
@@ -118,27 +123,70 @@ class FastWAM(torch.nn.Module):
         if "text_dim" not in video_dit_config:
             raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
 
-        components = load_wan22_ti2v_5b_components(
-            device=device,
-            torch_dtype=torch_dtype,
-            model_id=model_id,
-            tokenizer_model_id=tokenizer_model_id,
-            tokenizer_max_len=tokenizer_max_len,
-            redirect_common_files=redirect_common_files,
-            dit_config=video_dit_config,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
-            load_text_encoder=load_text_encoder,
-            vision_tokenizer_config=vision_tokenizer_config,
-        )
+        if init_action_from_video and not skip_dit_load_from_pretrain:
+            raise ValueError(
+                "`init_action_from_video=true` is reserved for the random-init "
+                "experiment and requires `skip_dit_load_from_pretrain=true`."
+            )
+        if init_action_from_video and random_init_seed is None:
+            raise ValueError(
+                "`init_action_from_video=true` requires an explicit `random_init_seed`."
+            )
 
-        video_expert = components.dit
-        action_expert = ActionDiT.from_pretrained(
-            action_dit_config=action_dit_config,
-            action_dit_pretrained_path=action_dit_pretrained_path,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
-            device=device,
-            torch_dtype=torch_dtype,
+        rng_context = (
+            torch.random.fork_rng(devices=[])
+            if random_init_seed is not None
+            else nullcontext()
         )
+        with rng_context:
+            if random_init_seed is not None:
+                torch.manual_seed(int(random_init_seed))
+            components = load_wan22_ti2v_5b_components(
+                device=device,
+                torch_dtype=torch_dtype,
+                model_id=model_id,
+                tokenizer_model_id=tokenizer_model_id,
+                tokenizer_max_len=tokenizer_max_len,
+                redirect_common_files=redirect_common_files,
+                dit_config=video_dit_config,
+                skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+                load_text_encoder=load_text_encoder,
+                vision_tokenizer_config=vision_tokenizer_config,
+            )
+
+            video_expert = components.dit
+            # Give action-only boundary tensors a deterministic stream that is
+            # independent of tokenizer checkpoint construction. The backbone
+            # is overwritten below from this run's random Video DiT.
+            if random_init_seed is not None:
+                torch.manual_seed(int(random_init_seed) + 1)
+            action_expert = ActionDiT.from_pretrained(
+                action_dit_config=action_dit_config,
+                action_dit_pretrained_path=action_dit_pretrained_path,
+                skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+                device=device,
+                torch_dtype=torch_dtype,
+            )
+            if init_action_from_video:
+                action_state = action_expert.state_dict()
+                backbone_keys = ActionDiT.backbone_key_set(action_state.keys())
+                initialized, report = build_action_backbone_from_video(
+                    video_state=video_expert.state_dict(),
+                    action_state=action_state,
+                    backbone_keys=backbone_keys,
+                    apply_alpha_scaling=bool(action_init_alpha_scaling),
+                )
+                merged = dict(action_state)
+                merged.update(initialized)
+                action_expert.load_state_dict(merged, strict=True)
+                logger.info(
+                    "Initialized random ActionDiT backbone from random Video DiT "
+                    "(seed=%d, copied=%d, interpolated=%d, alpha_scaling=%s).",
+                    int(random_init_seed),
+                    report["copied"],
+                    report["interpolated"],
+                    report["alpha_scaling"],
+                )
         if int(action_expert.num_heads) != int(video_expert.num_heads):
             raise ValueError("ActionDiT `num_heads` must match video expert for MoT mixed attention.")
         if int(action_expert.attn_head_dim) != int(video_expert.attn_head_dim):
@@ -177,8 +225,24 @@ class FastWAM(torch.nn.Module):
             "text_encoder": components.text_encoder_path,
             "tokenizer": components.tokenizer_path,
             "action_dit_backbone": (
-                "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
+                (
+                    "RANDOM_VIDEO_DIT_INTERPOLATED"
+                    if init_action_from_video
+                    else "SKIPPED_PRETRAIN"
+                )
+                if skip_dit_load_from_pretrain
+                else action_dit_pretrained_path
             ),
+        }
+        model.initialization = {
+            "random_init_seed": random_init_seed,
+            "video_dit": "random" if skip_dit_load_from_pretrain else "wan_pretrained",
+            "action_dit_backbone": (
+                "random_video_dit_interpolated"
+                if init_action_from_video
+                else ("random" if skip_dit_load_from_pretrain else "preprocessed_checkpoint")
+            ),
+            "action_init_alpha_scaling": bool(action_init_alpha_scaling),
         }
         return model
 
