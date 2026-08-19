@@ -495,7 +495,30 @@ def run_inference(cfg: DictConfig):
     }
 
     infer_out = model.infer(**infer_kwargs)
-    video = infer_out["video"]
+    video = infer_out.get("video")
+    if video is None:
+        video_latents = infer_out.get("video_latents")
+        if not isinstance(video_latents, torch.Tensor) or not bool(
+            getattr(model.vae, "supports_pca_visualization", False)
+        ):
+            raise RuntimeError(
+                "Inference returned no RGB video and the visual tokenizer has no PCA fallback."
+            )
+        pca_video = model.vae.decode_pca(
+            video_latents,
+            output_size=(int(inference_cfg.height), int(inference_cfg.width)),
+            seed=int(inference_cfg.seed),
+        )[0]
+        pca_video = (
+            (pca_video.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5
+        ).round().to(torch.uint8)
+        video = [
+            Image.fromarray(pca_video[:, frame_index].permute(1, 2, 0).numpy())
+            for frame_index in range(pca_video.shape[1])
+        ]
+        logger.warning(
+            "Saved PCA pseudo-colour V-JEPA latents; output is not an RGB reconstruction."
+        )
     save_mp4(video, output_mp4, fps=15)
     logger.info("Saved inference video to %s", output_mp4)
     return output_mp4

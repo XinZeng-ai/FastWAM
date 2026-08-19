@@ -553,6 +553,11 @@ def create_framewise_rae_video_tokenizer(
     device: str | torch.device,
     torch_dtype: torch.dtype,
 ) -> FramewiseRAEVideoTokenizer:
+    encoder_type = str(config.get("encoder_type", "")).strip().lower()
+    if encoder_type.startswith("vjepa2_1_"):
+        from .vjepa_video_tokenizer import create_vjepa21_video_tokenizer
+
+        return create_vjepa21_video_tokenizer(config, device, torch_dtype)
     tokenizer = FramewiseRAEVideoTokenizer(**config)
     # Keep statistics in fp32; cast only the frozen networks.
     tokenizer.to(device=device)

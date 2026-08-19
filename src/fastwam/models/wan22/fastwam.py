@@ -340,6 +340,13 @@ class FastWAM(torch.nn.Module):
             frames.append(Image.fromarray(frame))
         return frames
 
+    @torch.no_grad()
+    def _format_inferred_video(self, latents, tiled=False) -> dict[str, Any]:
+        """Return RGB frames when available, otherwise normalized visual latents."""
+        if bool(getattr(self.vae, "supports_rgb_decode", True)):
+            return {"video": self._decode_latents(latents, tiled=tiled)}
+        return {"video_latents": latents.detach()}
+
     def build_inputs(self, sample, tiled: bool = False):
         video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:
@@ -964,7 +971,7 @@ class FastWAM(torch.nn.Module):
                 )
 
         return {
-            "video": self._decode_latents(latents_video, tiled=tiled),
+            **self._format_inferred_video(latents_video, tiled=tiled),
             "action": action_out,
         }
 

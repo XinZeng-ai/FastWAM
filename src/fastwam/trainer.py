@@ -429,6 +429,13 @@ class Wan22Trainer:
         all_action_l2 = []
         all_action_l1 = []
         all_stitched_frames = []
+        has_rgb_decoder = bool(getattr(model.vae, "supports_rgb_decode", True))
+        if not has_rgb_decoder and not bool(
+            getattr(model.vae, "supports_pca_visualization", False)
+        ):
+            raise RuntimeError(
+                "Visual tokenizer has no RGB decoder and provides no PCA visualization fallback."
+            )
 
         processor = lerobot_ds.processor
 
@@ -469,20 +476,46 @@ class Wan22Trainer:
                 infer_kwargs["prompt"] = prompt
 
             pred = model.infer(**infer_kwargs)
-            pred_video = pred["video"]
             pred_action = pred.get("action", None)
 
-            # 3. inference metrics against GT video
-            pred_video_tensor = pil_frames_to_video_tensor(pred_video)
+            # 3. inference visualization/metrics against GT video. V-JEPA has
+            # no RGB decoder, so use a shared PCA basis for predicted and GT
+            # latents strictly as a diagnostic visualization; RGB metrics are
+            # intentionally unavailable in that branch.
             gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
-
-            assert pred_video_tensor.shape == gt_video_tensor.shape, (
-                "Eval infer prediction/GT shape mismatch: "
-                f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-            )
-
-            all_psnr_rg.append(video_psnr(pred=pred_video_tensor, target=gt_video_tensor))
-            all_ssim_rg.append(video_ssim(pred=pred_video_tensor, target=gt_video_tensor))
+            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+            if has_rgb_decoder:
+                pred_video_tensor = pil_frames_to_video_tensor(pred["video"])
+                assert pred_video_tensor.shape == gt_video_tensor.shape, (
+                    "Eval infer prediction/GT shape mismatch: "
+                    f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+                )
+                all_psnr_rg.append(video_psnr(pred=pred_video_tensor, target=gt_video_tensor))
+                all_ssim_rg.append(video_ssim(pred=pred_video_tensor, target=gt_video_tensor))
+            else:
+                pred_latents = pred.get("video_latents", None)
+                if not isinstance(pred_latents, torch.Tensor):
+                    raise TypeError(
+                        "Decoder-free inference must return tensor `video_latents`, got "
+                        f"{type(pred_latents)}"
+                    )
+                gt_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+                if pred_latents.shape != gt_latents.shape:
+                    raise ValueError(
+                        "PCA predicted/GT latent shape mismatch: "
+                        f"pred={tuple(pred_latents.shape)}, gt={tuple(gt_latents.shape)}"
+                    )
+                pca_video = model.vae.decode_pca(
+                    torch.cat((pred_latents, gt_latents), dim=0),
+                    output_size=(video0.shape[-2], video0.shape[-1]),
+                    seed=42,
+                )
+                pred_video_tensor = (
+                    (pca_video[0].detach().float().cpu().clamp(-1, 1) + 1.0) * 0.5
+                )
+                vae_video_tensor = (
+                    (pca_video[1].detach().float().cpu().clamp(-1, 1) + 1.0) * 0.5
+                )
 
             # action metrics
             if action is not None and pred_action is not None:
@@ -536,23 +569,24 @@ class Wan22Trainer:
                 all_action_l1.append(action_diff.abs().mean().item())
                 all_action_l2.append(action_diff.pow(2).mean().item())
 
-            # 4. VAE reconstruction metrics
-            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-            vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-            vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+            # 4. RGB reconstruction metrics, only for tokenizers with a real
+            # pixel decoder. PCA colours have no pixel-space metric meaning.
+            if has_rgb_decoder:
+                vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+                vae_recon_video = model._decode_latents(vae_latents, tiled=False)
+                vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
 
-            assert vae_video_tensor.shape == gt_video_tensor.shape, (
-                "Eval VAE reconstruction/GT shape mismatch: "
-                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-            )
+                assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                    "Eval VAE reconstruction/GT shape mismatch: "
+                    f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+                )
 
-            all_psnr_dg.append(video_psnr(pred=vae_video_tensor, target=gt_video_tensor))
-            all_ssim_dg.append(video_ssim(pred=vae_video_tensor, target=gt_video_tensor))
-            all_psnr_rd.append(video_psnr(pred=pred_video_tensor, target=vae_video_tensor))
-            all_ssim_rd.append(video_ssim(pred=pred_video_tensor, target=vae_video_tensor))
+                all_psnr_dg.append(video_psnr(pred=vae_video_tensor, target=gt_video_tensor))
+                all_ssim_dg.append(video_ssim(pred=vae_video_tensor, target=gt_video_tensor))
+                all_psnr_rd.append(video_psnr(pred=pred_video_tensor, target=vae_video_tensor))
+                all_ssim_rd.append(video_ssim(pred=pred_video_tensor, target=vae_video_tensor))
 
-            # 5. Stitch [pred | vae | gt] horizontally, accumulate frames
+            # 5. Stitch [pred | reconstruction/GT-latent-PCA | GT RGB].
             stitched_video_tensor = torch.cat(
                 [pred_video_tensor, vae_video_tensor, gt_video_tensor],
                 dim=3,
@@ -570,39 +604,52 @@ class Wan22Trainer:
 
         # --- Average metrics across N windows ---
         has_action = len(all_action_l2) > 0
-        local_metrics = torch.tensor(
+        metric_values = [sum(all_val_losses) / N]
+        if has_rgb_decoder:
+            metric_values.extend(
+                [
+                    sum(all_psnr_rg) / N,
+                    sum(all_ssim_rg) / N,
+                    sum(all_psnr_rd) / N,
+                    sum(all_ssim_rd) / N,
+                    sum(all_psnr_dg) / N,
+                    sum(all_ssim_dg) / N,
+                ]
+            )
+        metric_values.extend(
             [
-                sum(all_val_losses) / N,
-                sum(all_psnr_rg) / N,
-                sum(all_ssim_rg) / N,
-                sum(all_psnr_rd) / N,
-                sum(all_ssim_rd) / N,
-                sum(all_psnr_dg) / N,
-                sum(all_ssim_dg) / N,
                 (sum(all_action_l2) / len(all_action_l2)) if has_action else -1.0,
                 (sum(all_action_l1) / len(all_action_l1)) if has_action else -1.0,
-            ],
-            device=self.accelerator.device,
-            dtype=torch.float32,
+            ]
+        )
+        local_metrics = torch.tensor(
+            metric_values, device=self.accelerator.device, dtype=torch.float32
         ).unsqueeze(0)
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
-        mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if has_action else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if has_action else None
+        mean_metrics = gathered_metrics.mean(dim=0)
+        action_offset = 7 if has_rgb_decoder else 1
+        action_l2_mean = mean_metrics[action_offset].item() if has_action else None
+        action_l1_mean = mean_metrics[action_offset + 1].item() if has_action else None
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
         result = {
             "val_loss": float(mean_metrics[0].item()),
-            "psnr_rg": float(mean_metrics[1].item()),
-            "ssim_rg": float(mean_metrics[2].item()),
-            "psnr_rd": float(mean_metrics[3].item()),
-            "ssim_rd": float(mean_metrics[4].item()),
-            "psnr_dg": float(mean_metrics[5].item()),
-            "ssim_dg": float(mean_metrics[6].item()),
             "video_path": video_path,
+            "rgb_metrics_available": has_rgb_decoder,
         }
+        if has_rgb_decoder:
+            result.update(
+                {
+                    "psnr_rg": float(mean_metrics[1].item()),
+                    "ssim_rg": float(mean_metrics[2].item()),
+                    "psnr_rd": float(mean_metrics[3].item()),
+                    "ssim_rd": float(mean_metrics[4].item()),
+                    "psnr_dg": float(mean_metrics[5].item()),
+                    "ssim_dg": float(mean_metrics[6].item()),
+                }
+            )
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
@@ -778,17 +825,22 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = (
-                                "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f "
-                                "recon_psnr=%.4f recon_ssim=%.4f"
-                            ) % (
+                            description = "[eval] step=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
-                                metrics["psnr_dg"],
-                                metrics["ssim_dg"],
                             )
+                            if metrics["rgb_metrics_available"]:
+                                description += (
+                                    " infer_psnr=%.4f infer_ssim=%.4f "
+                                    "recon_psnr=%.4f recon_ssim=%.4f"
+                                ) % (
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                    metrics["psnr_dg"],
+                                    metrics["ssim_dg"],
+                                )
+                            else:
+                                description += " rgb_metrics=unavailable pca_visualization=%s" % metrics["video_path"]
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
@@ -796,13 +848,18 @@ class Wan22Trainer:
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
+                            if metrics["rgb_metrics_available"]:
+                                eval_payload.update(
+                                    {
+                                        "eval/psnr_rg": float(metrics["psnr_rg"]),
+                                        "eval/ssim_rg": float(metrics["ssim_rg"]),
+                                        "eval/psnr_rd": float(metrics["psnr_rd"]),
+                                        "eval/ssim_rd": float(metrics["ssim_rd"]),
+                                        "eval/psnr_dg": float(metrics["psnr_dg"]),
+                                        "eval/ssim_dg": float(metrics["ssim_dg"]),
+                                    }
+                                )
                             if "action_l2" in metrics:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:

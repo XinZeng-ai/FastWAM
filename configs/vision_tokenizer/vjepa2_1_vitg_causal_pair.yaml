@@ -1,0 +1,13 @@
+# @package model
+
+vision_tokenizer_config:
+  encoder_type: vjepa2_1_vitg_causal_pair
+  encoder_path: checkpoints/VJEPA2.1-ViT-G-2B/vjepa2_1_vitG_384.pt
+  stats_path: ${oc.env:RAE_STATS_PATH,checkpoints/VJEPA2.1-ViT-G-2B/robotwin_clean2500_train_stats_causal_pair.pt}
+  stats_dataset: ${data.rae_stats_dataset}
+  vjepa2_repo_path: ${oc.env:VJEPA2_REPO_PATH,third_party/vjepa2}
+  eps: 1.0e-5
+
+video_dit_config:
+  in_dim: 1664
+  out_dim: 1664

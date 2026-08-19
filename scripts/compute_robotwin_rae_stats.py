@@ -21,6 +21,10 @@ from fastwam.models.wan22.rae_video_tokenizer import (
     _MAEEncoder,
     _SigLIP2Encoder,
 )
+from fastwam.models.wan22.vjepa_video_tokenizer import (
+    VJEPA21ViTGEncoder,
+    build_causal_pairs,
+)
 
 
 class _RoboTwinEpisodeVideoDataset(Dataset):
@@ -72,7 +76,12 @@ def parse_args():
     parser.add_argument(
         "--representation",
         required=True,
-        choices=("dinov3_k7", "siglip2_b", "mae_b"),
+        choices=(
+            "dinov3_k7",
+            "siglip2_b",
+            "mae_b",
+            "vjepa2_1_vitg_causal_pair",
+        ),
     )
     parser.add_argument("--output", required=True)
     parser.add_argument(
@@ -137,6 +146,12 @@ def parse_args():
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--encoder-dtype",
+        choices=("auto", "float32", "bfloat16"),
+        default="auto",
+        help="auto uses bfloat16 for V-JEPA 2B and float32 for older RAEs.",
+    )
+    parser.add_argument(
         "--data-parallel",
         action="store_true",
         help="Use every visible CUDA GPU through torch.nn.DataParallel.",
@@ -146,12 +161,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    is_causal_pair = args.representation == "vjepa2_1_vitg_causal_pair"
     if args.sample_frames is not None and args.sample_frames <= 0:
         raise ValueError(f"`--sample-frames` must be positive, got {args.sample_frames}")
     if args.unique_frames and args.sample_frames is not None:
         raise ValueError("`--unique-frames` and `--sample-frames` are mutually exclusive")
     if args.episode_streaming and not args.unique_frames:
         raise ValueError("`--episode-streaming` requires `--unique-frames`")
+    if is_causal_pair and args.unique_frames and not args.episode_streaming:
+        raise ValueError(
+            "V-JEPA causal-pair full stats require --unique-frames "
+            "--episode-streaming so stride-4 pairs can be weighted exactly"
+        )
     if not 0.0 <= args.sample_phase < 1.0:
         raise ValueError(f"`--sample-phase` must be in [0, 1), got {args.sample_phase}")
     root = Path(__file__).resolve().parents[1]
@@ -170,14 +191,14 @@ def main():
             config_name="train",
             overrides=[f"task={task}", f"data={args.data_config}"],
         )
-    # Stats are position-wise over independent frames; they have no temporal
-    # axis. Decode nine contiguous frames instead of the training action window
-    # of 33 frames followed by stride-4 selection. The camera mosaic, spatial
-    # resize, pixel normalization, and resulting [3,9,384,320] tensor are
-    # unchanged, while video decoding work is reduced by roughly 33/9.
-    cfg.data.train.num_frames = 9
-    cfg.data.train.action_video_freq_ratio = 1
-    cfg.data.train.processor.num_obs_steps = 9
+    # Frame representations are position-wise and can decode nine contiguous
+    # frames cheaply. Causal pairs must retain the training stride of four:
+    # [t0,t0], [t0,t4], ..., [t28,t32]. Episode-streaming below covers every
+    # distinct valid self-pair and lag-4 pair exactly once, matching the unique
+    # source-frame population used by the existing RAE formal stats.
+    cfg.data.train.num_frames = 33 if is_causal_pair else 9
+    cfg.data.train.action_video_freq_ratio = 4 if is_causal_pair else 1
+    cfg.data.train.processor.num_obs_steps = 33 if is_causal_pair else 9
     tokenizer_cfg = OmegaConf.to_container(
         cfg.model.vision_tokenizer_config, resolve=True
     )
@@ -194,12 +215,24 @@ def main():
     elif args.representation == "siglip2_b":
         encoder = _SigLIP2Encoder(encoder_path)
         channels = 768
-    else:
+    elif args.representation == "mae_b":
         encoder = _MAEEncoder(encoder_path)
         channels = 768
+    else:
+        repo_path = Path(tokenizer_cfg["vjepa2_repo_path"])
+        if not repo_path.is_absolute():
+            repo_path = root / repo_path
+        encoder = VJEPA21ViTGEncoder(encoder_path, repo_path)
+        channels = 1664
 
     device = torch.device(args.device)
-    encoder.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
+    encoder_dtype = (
+        torch.bfloat16
+        if args.encoder_dtype == "bfloat16"
+        or (args.encoder_dtype == "auto" and is_causal_pair)
+        else torch.float32
+    )
+    encoder.to(device=device, dtype=encoder_dtype).eval().requires_grad_(False)
     visible_cuda_devices = 0
     if device.type == "cuda":
         visible_cuda_devices = torch.cuda.device_count()
@@ -235,7 +268,12 @@ def main():
                     f"Invalid RoboTwin episode bounds: from={start}, to={stop}"
                 )
             indices.extend(range(start, stop, frames_per_sample))
-            expected_unique_frames += stop - start
+            episode_frames = stop - start
+            if is_causal_pair:
+                # Every [t,t] and every valid [t,t+4] source pair once.
+                expected_unique_frames += episode_frames + max(0, episode_frames - 4)
+            else:
+                expected_unique_frames += episode_frames
         selected_windows = len(indices)
         if args.episode_streaming:
             dataset = _RoboTwinEpisodeVideoDataset(dataset)
@@ -303,6 +341,24 @@ def main():
     total = torch.zeros(channels, 24, 20, dtype=torch.float64)
     total_sq = torch.zeros_like(total)
     count = 0
+    encoded_items = 0
+
+    def accumulate(latents, weights=None):
+        nonlocal total, total_sq, count, encoded_items
+        latents = latents.double()
+        if weights is None:
+            weights = torch.ones(latents.shape[0], device=latents.device, dtype=torch.float64)
+        else:
+            weights = weights.to(device=latents.device, dtype=torch.float64)
+        if weights.ndim != 1 or weights.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"Stats weights {tuple(weights.shape)} do not match latents {tuple(latents.shape)}"
+            )
+        expanded = weights[:, None, None, None]
+        total += (latents * expanded).sum(dim=0).cpu()
+        total_sq += (latents.square() * expanded).sum(dim=0).cpu()
+        count += int(weights.sum().item())
+        encoded_items += int(latents.shape[0])
     batches = loader
     if args.max_batches is not None:
         batches = itertools.islice(loader, args.max_batches)
@@ -316,17 +372,35 @@ def main():
                         f"{tuple(video.shape)}"
                     )
                 images = video.permute(1, 0, 2, 3)
-                for image_chunk in images.split(args.batch_size, dim=0):
-                    tokens = encoder(
-                        image_chunk.to(device=device, non_blocking=True)
-                    )
-                    latents = tokens.transpose(1, 2).reshape(
-                        image_chunk.shape[0], channels, 24, 20
-                    )
-                    latents = latents.double()
-                    total += latents.sum(dim=0).cpu()
-                    total_sq += latents.square().sum(dim=0).cpu()
-                    count += latents.shape[0]
+                if is_causal_pair:
+                    self_pairs = torch.stack((images, images), dim=2)
+                    if images.shape[0] > 4:
+                        transition_pairs = torch.stack((images[:-4], images[4:]), dim=2)
+                        pair_inputs = torch.cat((self_pairs, transition_pairs), dim=0)
+                    else:
+                        pair_inputs = self_pairs
+                    for start in range(0, pair_inputs.shape[0], args.batch_size):
+                        input_chunk = pair_inputs[start : start + args.batch_size]
+                        tokens = encoder(
+                            input_chunk.to(
+                                device=device, dtype=encoder_dtype, non_blocking=True
+                            )
+                        )
+                        latents = tokens.transpose(1, 2).reshape(
+                            input_chunk.shape[0], channels, 24, 20
+                        )
+                        accumulate(latents)
+                else:
+                    for image_chunk in images.split(args.batch_size, dim=0):
+                        tokens = encoder(
+                            image_chunk.to(
+                                device=device, dtype=encoder_dtype, non_blocking=True
+                            )
+                        )
+                        latents = tokens.transpose(1, 2).reshape(
+                            image_chunk.shape[0], channels, 24, 20
+                        )
+                        accumulate(latents)
                 continue
             if tuple(video.shape[1:]) != (3, 9, 384, 320):
                 raise ValueError(
@@ -334,10 +408,19 @@ def main():
                     f"{tuple(video.shape)}"
                 )
             batch, _, frames, height, width = video.shape
-            images = video.permute(0, 2, 1, 3, 4).reshape(
-                batch * frames, 3, height, width
+            if is_causal_pair:
+                encoder_inputs = build_causal_pairs(video).permute(0, 2, 1, 3, 4, 5).reshape(
+                    batch * frames, 3, 2, height, width
+                )
+            else:
+                encoder_inputs = video.permute(0, 2, 1, 3, 4).reshape(
+                    batch * frames, 3, height, width
+                )
+            tokens = encoder(
+                encoder_inputs.to(
+                    device=device, dtype=encoder_dtype, non_blocking=True
+                )
             )
-            tokens = encoder(images.to(device=device, non_blocking=True))
             latents = tokens.transpose(1, 2).reshape(
                 batch * frames, channels, 24, 20
             )
@@ -360,10 +443,7 @@ def main():
                 if remaining <= 0:
                     break
                 latents = latents[:remaining]
-            latents = latents.double()
-            total += latents.sum(dim=0).cpu()
-            total_sq += latents.square().sum(dim=0).cpu()
-            count += latents.shape[0]
+            accumulate(latents)
 
     if count < 2:
         raise RuntimeError(f"Need at least two frames for statistics, got {count}")
@@ -394,6 +474,7 @@ def main():
             "mean": mean.float(),
             "var": var.float(),
             "count": count,
+            "encoded_items": encoded_items,
             "dataset": (
                 "robotwin_clean2500_train"
                 if args.data_config == "robotwin_clean2500"
@@ -418,8 +499,13 @@ def main():
             "requested_frames": args.sample_frames,
             "sample_phase": args.sample_phase,
             "stats_cuda_devices": visible_cuda_devices,
-            "stats_dataset_num_frames": 9,
-            "stats_action_video_freq_ratio": 1,
+            "stats_dataset_num_frames": 33 if is_causal_pair else 9,
+            "stats_action_video_freq_ratio": 4 if is_causal_pair else 1,
+            "encoder_dtype": str(encoder_dtype).removeprefix("torch."),
+            "causal_pair_lag_source_frames": 4 if is_causal_pair else None,
+            "causal_pair_unique_source_pairs": bool(
+                is_causal_pair and args.episode_streaming
+            ),
             "max_batches": args.max_batches,
         },
         output,

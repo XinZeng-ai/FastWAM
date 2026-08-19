@@ -447,6 +447,6 @@ class FastWAMIDM(FastWAMJoint):
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         return {
-            "video": self._decode_latents(latents_video, tiled=tiled),
+            **self._format_inferred_video(latents_video, tiled=tiled),
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
