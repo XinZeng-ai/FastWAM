@@ -661,7 +661,38 @@ class WorldActionRobotWinPolicy:
 
         if save_this_prediction:
             try:
-                self._save_prediction_clip(pred["video"], observation)
+                predicted_video = pred.get("video")
+                if predicted_video is None:
+                    video_latents = pred.get("video_latents")
+                    if not isinstance(video_latents, torch.Tensor):
+                        raise KeyError(
+                            "Inference returned neither RGB `video` nor tensor `video_latents`."
+                        )
+                    if not bool(
+                        getattr(self.model.vae, "supports_pca_visualization", False)
+                    ):
+                        raise RuntimeError(
+                            "Decoder-free visual tokenizer provides no PCA visualization."
+                        )
+                    pca_video = self.model.vae.decode_pca(
+                        video_latents,
+                        output_size=(image_tensor.shape[-2], image_tensor.shape[-1]),
+                        seed=self.seed,
+                    )[0]
+                    pca_video = (
+                        (pca_video.detach().float().cpu().clamp(-1, 1) + 1.0)
+                        * 127.5
+                    ).round().to(torch.uint8)
+                    predicted_video = [
+                        Image.fromarray(
+                            pca_video[:, frame_index].permute(1, 2, 0).numpy()
+                        )
+                        for frame_index in range(pca_video.shape[1])
+                    ]
+                    logger.info(
+                        "Saving V-JEPA prediction as PCA pseudo-colour; this is not an RGB reconstruction."
+                    )
+                self._save_prediction_clip(predicted_video, observation)
             except Exception:
                 logger.exception(
                     "Failed to save predicted video for episode=%d replan=%d; "
